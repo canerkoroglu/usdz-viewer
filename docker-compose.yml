@@ -1,0 +1,32 @@
+# Docker Compose for usdz-viewer
+# The ./data directory on the host is bind-mounted read-only; model files are
+# NOT baked into the image.
+services:
+  usdz-viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: usdz-viewer:latest
+    container_name: usdz-viewer
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./data:/app/data:ro
+    environment:
+      - PORT=8090
+      - NODE_ENV=production
+      - DATA_DIR=/app/data
+    healthcheck:
+      # Node's built-in fetch — no curl/wget needed inside the image.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.PORT||8090)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

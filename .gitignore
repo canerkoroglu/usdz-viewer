@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Model assets are bind-mounted at runtime; don't commit large binaries.
+/data/*
+!/data/.gitkeep

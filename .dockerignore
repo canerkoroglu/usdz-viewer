@@ -1,0 +1,14 @@
+# Keep the build context small & reproducible.
+# Model files are bind-mounted at runtime, never baked into the image.
+node_modules
+dist
+data
+.git
+.gitignore
+*.log
+npm-debug.log*
+.DS_Store
+.vscode
+.idea
+README.md
+scratchpad

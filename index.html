@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0f1115" />
+    <title>USD / USDZ Viewer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234c8dff' d='M12 2 3 7v10l9 5 9-5V7z'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- ==================== SETTINGS SIDEBAR (left, always visible) ==================== -->
+      <aside id="settings-panel" aria-label="Viewer settings">
+        <header class="sidebar-brand">
+          <h1 class="app-title">USD&nbsp;Viewer</h1>
+          <p class="app-subtitle">USD · USDA · USDC · USDZ</p>
+        </header>
+
+        <div class="settings-subhead">
+          <span>Settings</span>
+          <div class="settings-subhead-actions">
+            <button id="reset-settings-btn" class="btn btn-small" type="button" title="Restore default settings">Reset all</button>
+            <button id="settings-close" class="btn btn-icon" type="button" aria-label="Close settings" title="Close settings">✕</button>
+          </div>
+        </div>
+
+        <div class="settings-scroll">
+          <details class="section" open>
+            <summary>Presets</summary>
+            <div class="section-body" id="sec-presets"></div>
+          </details>
+
+          <details class="section">
+            <summary>Lighting</summary>
+            <div class="section-body" id="sec-lighting"></div>
+          </details>
+
+          <details class="section" id="details-embedded" hidden>
+            <summary>Embedded USD lights <span id="embedded-count" class="pill"></span></summary>
+            <div class="section-body" id="sec-embedded"></div>
+          </details>
+
+          <details class="section">
+            <summary>Shadows</summary>
+            <div class="section-body" id="sec-shadows"></div>
+          </details>
+
+          <details class="section">
+            <summary>Environment</summary>
+            <div class="section-body" id="sec-environment"></div>
+          </details>
+
+          <details class="section">
+            <summary>Ground</summary>
+            <div class="section-body" id="sec-ground"></div>
+          </details>
+
+          <details class="section">
+            <summary>Model transform</summary>
+            <div class="section-body" id="sec-model"></div>
+          </details>
+
+          <details class="section">
+            <summary>Performance</summary>
+            <div class="section-body" id="sec-performance"></div>
+          </details>
+
+          <details class="section">
+            <summary>AR (WebXR)</summary>
+            <div class="section-body" id="sec-ar"></div>
+          </details>
+        </div>
+      </aside>
+
+      <!-- ============================== VIEWER ============================== -->
+      <main id="viewer">
+        <div id="topbar">
+          <button id="settings-toggle" class="btn btn-icon" type="button" title="Toggle settings" aria-label="Toggle settings">☰</button>
+          <button id="models-btn" class="btn btn-small" type="button" title="Browse models">▤&nbsp;Models</button>
+          <span id="current-model" class="current-model" title="Change model" role="button" tabindex="0">No model selected</span>
+          <div class="topbar-spacer"></div>
+          <div id="ar-button-holder"></div>
+        </div>
+
+        <div id="canvas-holder">
+          <div id="loading" class="overlay-center" hidden>
+            <div class="spinner" aria-hidden="true"></div>
+            <div id="loading-text" class="overlay-text">Loading…</div>
+          </div>
+
+          <div id="empty-state" class="overlay-center" hidden>
+            <div class="empty-icon" aria-hidden="true">📦</div>
+            <div class="overlay-text">No model selected</div>
+            <div class="muted">Open <strong>Models</strong> to pick one, or drop a USD file here.</div>
+          </div>
+
+          <div id="error-banner" class="error-banner" role="alert" hidden>
+            <span id="error-text"></span>
+            <button id="error-close" class="btn btn-small" type="button">Dismiss</button>
+          </div>
+
+          <div id="viewer-hint" class="viewer-hint">Drag to orbit · scroll to zoom · right-drag to pan · double-click or F to fit</div>
+        </div>
+      </main>
+    </div>
+
+    <!-- ======================= MODEL SELECTION MODAL ======================= -->
+    <div id="models-modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-box" role="dialog" aria-modal="true" aria-label="Select a model">
+        <header class="modal-header">
+          <div class="modal-title">Select model <span id="model-count" class="pill">0</span></div>
+          <div class="modal-header-actions">
+            <button id="refresh-btn" class="btn btn-small" type="button" title="Rescan data directory">↻ Refresh</button>
+            <button id="models-close" class="btn btn-icon" type="button" aria-label="Close">✕</button>
+          </div>
+        </header>
+        <div class="modal-search">
+          <input id="model-search" class="search-input" type="search" placeholder="Search models… (accent-insensitive)" autocomplete="off" spellcheck="false" aria-label="Search models" />
+        </div>
+        <div id="model-list" class="model-list" role="listbox" aria-label="Available models"></div>
+        <footer class="modal-footer"><span id="data-note" class="muted"></span></footer>
+      </div>
+    </div>
+
+    <!-- ===================== AR DOM OVERLAY (WebXR) ===================== -->
+    <!-- Hidden until an AR session starts; three.js ARButton toggles inline display. -->
+    <div id="ar-overlay" style="display: none">
+      <div id="ar-status" class="ar-status">Point at a surface…</div>
+      <div id="ar-controls" class="ar-controls">
+        <button data-ar="scale-down" class="ar-btn" type="button">−</button>
+        <button data-ar="scale-up" class="ar-btn" type="button">+</button>
+        <button data-ar="rotate" class="ar-btn" type="button">⟳</button>
+        <button data-ar="reset" class="ar-btn" type="button">Reset</button>
+        <button data-ar="exit" class="ar-btn ar-btn-exit" type="button">Exit AR</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
