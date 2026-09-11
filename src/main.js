@@ -25,7 +25,6 @@ import {
   PCFShadowMap,
   ColorManagement,
   AnimationMixer,
-  Clock,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
@@ -361,7 +360,7 @@ function applyShadows() {
     }
   }
   keyLight.shadow.bias = settings.shadow.bias;
-  keyLight.shadow.normalBias = settings.shadow.normalBias;
+  updateShadowCamera(); // frustum + scale-aware normal bias
   groundMesh.receiveShadow = settings.ground.receive;
   // Toggling shadow support on/off at runtime needs the shaders recompiled,
   // otherwise the ground ShadowMaterial keeps sampling the retained shadow map.
@@ -405,6 +404,11 @@ function updateShadowCamera() {
   cam.near = 0.05;
   cam.far = R * 30 + 30;
   cam.updateProjectionMatrix();
+  // Normal bias is a world-space offset, so it has to follow the shadow texel
+  // size (frustum / map resolution): otherwise large models get acne and tiny
+  // ones get detached shadows. Reference texel = R 0.5 at a 1024 map.
+  const texel = (R * 3.2) / keyLight.shadow.mapSize.width;
+  keyLight.shadow.normalBias = settings.shadow.normalBias * (texel / (1.6 / 1024));
 }
 
 // Everything that depends on the model's world size/position.
@@ -877,7 +881,7 @@ function fitCameraToObject(object3d, offset = 1.2) {
   dist *= offset;
   const dir = new Vector3(1, 0.6, 1).normalize();
   camera.position.copy(center).addScaledVector(dir, dist);
-  camera.near = Math.max(dist / 1000, 0.0005);
+  camera.near = Math.max(r * 0.05, 0.0005); // ~6.5k:1 far/near keeps the 24-bit depth buffer precise (no z-fighting)
   camera.far = dist * 100 + r * 40;
   camera.updateProjectionMatrix();
   controls.target.copy(center);
@@ -892,10 +896,26 @@ function fitCameraToObject(object3d, offset = 1.2) {
 function installGroup(group, displayName, meta = {}) {
   disposeCurrentModel();
   normalizeModel(group);
+  // Shadows on every mesh; anisotropic filtering so textures stay sharp at
+  // grazing angles (4 is a Quest-friendly level).
+  const aniso = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+  const seenTex = new Set();
   group.traverse((o) => {
-    if (o.isMesh) {
-      o.castShadow = true;
-      o.receiveShadow = true;
+    if (!o.isMesh) return;
+    o.castShadow = true;
+    o.receiveShadow = true;
+    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      if (!m) continue;
+      for (const k in m) {
+        const t = m[k];
+        if (t && t.isTexture && !seenTex.has(t)) {
+          seenTex.add(t);
+          if (t.anisotropy < aniso) {
+            t.anisotropy = aniso;
+            t.needsUpdate = true;
+          }
+        }
+      }
     }
   });
   modelContainer.add(group);
@@ -1004,7 +1024,14 @@ async function loadLocalFile(file) {
 // ===========================================================================
 // Animation playback (USD time samples / skeletal clips → AnimationMixer)
 // ===========================================================================
-const clock = new Clock();
+// Frame timing from the animation-loop timestamp (THREE.Clock is deprecated in
+// r186, and a hidden tab must not produce one giant delta when it resumes).
+let _lastFrameTime = 0;
+function frameDelta(now) {
+  const dt = _lastFrameTime ? (now - _lastFrameTime) / 1000 : 0;
+  _lastFrameTime = now;
+  return clamp(dt, 0, 0.1);
+}
 const anim = { mixer: null, clips: [], action: null, index: 0, playing: false, speed: 1 };
 let _scrubWasPlaying = false;
 let _lastTick = -1;
@@ -1966,8 +1993,8 @@ function resizeToDisplay() {
 // the scene is only drawn when something changed — camera motion, a setting,
 // a model swap, a resize. Idle frames cost nothing, which matters for battery
 // on Quest and phones. In an XR session every frame is drawn.
-function render(_time, frame) {
-  tickAnimation(clock.getDelta()); // getDelta() every frame so resuming never jumps
+function render(time, frame) {
+  tickAnimation(frameDelta(time));
   if (renderer.xr.isPresenting) {
     if (frame) updateAR(frame);
     renderer.render(scene, camera);
@@ -1982,6 +2009,27 @@ function render(_time, frame) {
 }
 renderer.setAnimationLoop(render);
 
+// GPU resets (common on standalone headsets): three restores the context, but
+// with render-on-demand nothing would redraw until something changed.
+renderer.domElement.addEventListener('webglcontextlost', () => {
+  showError('Graphics context lost — waiting for the GPU to recover…');
+});
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  clearError();
+  // Render-target textures (the generated environment map) do not survive a
+  // context loss and three cannot re-upload them, so rebuild the IBL; every
+  // other resource (geometry, image textures, shadow map) is re-created by three.
+  const oldEnv = scene.environment;
+  const gen = new PMREMGenerator(renderer);
+  scene.environment = gen.fromScene(new RoomEnvironment(), 0.04).texture;
+  gen.dispose();
+  if (oldEnv) oldEnv.dispose();
+  _shadowsWereEnabled = null; // force shader/shadow-map refresh on the new context
+  applyShadows();
+  applyPerformance(); // re-create the drawing buffer at the right size / pixel ratio
+  invalidate(3);
+});
+
 // OrbitControls applies wheel-zoom and keyboard pans inside its own handlers
 // (it calls update() itself), so the loop's update() sees nothing — the
 // controls' `change` event is the reliable "camera moved" signal.
@@ -1989,11 +2037,11 @@ controls.addEventListener('change', () => invalidate(2));
 
 // The render loop is the source of truth; these just nudge an immediate
 // correction so a rapid drag-resize or a tab switch doesn't show stale pixels.
-window.addEventListener('resize', () => {
-  resizeToDisplay();
+window.addEventListener('resize', () => applyPerformance()); // also re-applies the pixel-ratio cap after a devicePixelRatio change
+document.addEventListener('visibilitychange', () => {
+  _lastFrameTime = 0; // don't count the hidden time as one frame
   invalidate();
 });
-document.addEventListener('visibilitychange', () => invalidate());
 window.addEventListener('focus', () => invalidate());
 
 // ===========================================================================
