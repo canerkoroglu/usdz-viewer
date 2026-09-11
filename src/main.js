@@ -24,12 +24,15 @@ import {
   AgXToneMapping,
   PCFShadowMap,
   ColorManagement,
+  AnimationMixer,
+  Clock,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
 import { USDLoader } from 'three/addons/loaders/USDLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+import qrcode from 'qrcode-generator';
 
 import './style.css';
 
@@ -39,6 +42,8 @@ import './style.css';
 const STORAGE_KEY = 'usdz-viewer.settings.v1';
 const SECTIONS_KEY = 'usdz-viewer.sections.v1';
 const MODEL_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
+// Deep link: /?model=<filename> opens that model directly (see fetchModels).
+const linkedModel = new URLSearchParams(location.search).get('model');
 
 const TONE_MAPPING = {
   none: { label: 'None', value: NoToneMapping },
@@ -231,6 +236,7 @@ scene.add(modelContainer);
 let currentInner = null; // the loaded USD Group
 let modelHalfHeight = 0.5;
 let modelRadius = 1; // bounding-sphere radius of the *unscaled* model
+const modelSize = new Vector3(); // unscaled W × H × D in metres
 
 // Lights, ground and the shadow frustum scale with the model so that a 2 cm
 // figurine and a 20 m building both get a sensible rig.
@@ -798,6 +804,7 @@ function normalizeModel(group) {
   group.position.x = -center.x;
   group.position.z = -center.z;
   group.position.y = -_box.min.y;
+  modelSize.copy(size);
   modelHalfHeight = Math.max(size.y / 2, 0.01);
   modelRadius = Math.max(0.5 * Math.hypot(size.x, size.y, size.z), 0.25);
 }
@@ -819,6 +826,7 @@ function disposeGroup(group) {
 
 function disposeCurrentModel() {
   if (!currentInner) return;
+  teardownAnimation();
   modelContainer.remove(currentInner);
   disposeGroup(currentInner);
   currentInner = null;
@@ -864,7 +872,7 @@ function fitCameraToObject(object3d, offset = 1.2) {
 
 // Put a parsed USD group on stage: replaces the current model, normalizes it,
 // enables shadows, re-rigs lights/ground/shadow frustum, and frames the camera.
-function installGroup(group, displayName) {
+function installGroup(group, displayName, meta = {}) {
   disposeCurrentModel();
   normalizeModel(group);
   group.traverse((o) => {
@@ -879,6 +887,8 @@ function installGroup(group, displayName) {
   applyTransform(); // also re-rigs lights, ground and the shadow camera for the new size
   applyGround();
   fitCameraToObject(modelContainer);
+  setupAnimation(group);
+  renderModelInfo(displayName, group, meta);
   loadedModelName = displayName;
   setCurrentModelName(displayName);
   setLoading(false);
@@ -923,7 +933,7 @@ async function loadModel(model) {
       return;
     }
     setLoading(true, `Preparing ${model.name}…`);
-    installGroup(group, model.name);
+    installGroup(group, model.name, { size: model.size, extension: model.extension });
   } catch (err) {
     onLoadFailed(err, model.name, token);
   }
@@ -966,10 +976,261 @@ async function loadLocalFile(file) {
     ar.placed = false;
     refreshAllControls();
     renderModelList();
-    installGroup(group, name);
+    setUrlModel(null); // a local file has no shareable server URL
+    installGroup(group, name, { size: file.size, extension: extOf(file.name) });
   } catch (err) {
     onLoadFailed(err, file.name, token);
   }
+}
+
+// ===========================================================================
+// Animation playback (USD time samples / skeletal clips → AnimationMixer)
+// ===========================================================================
+const clock = new Clock();
+const anim = { mixer: null, clips: [], action: null, index: 0, playing: false, speed: 1 };
+let _scrubWasPlaying = false;
+let _lastTick = -1;
+const fmtTime = (t) => `${t.toFixed(1)} s`;
+
+function setupAnimation(group) {
+  const clips = (Array.isArray(group.animations) ? group.animations : []).filter((c) => c && c.duration > 0);
+  if (!clips.length) {
+    updateTransportUI();
+    return;
+  }
+  // Skinned bounds come from the bind pose, so let skinned meshes skip frustum
+  // culling — otherwise limbs can vanish at the viewport edge mid-animation.
+  group.traverse((o) => {
+    if (o.isSkinnedMesh) o.frustumCulled = false;
+  });
+  anim.mixer = new AnimationMixer(group);
+  anim.mixer.timeScale = anim.speed;
+  anim.clips = clips;
+  playClip(0);
+}
+
+function teardownAnimation() {
+  if (anim.mixer) {
+    anim.mixer.stopAllAction();
+    if (currentInner) anim.mixer.uncacheRoot(currentInner);
+  }
+  anim.mixer = null;
+  anim.clips = [];
+  anim.action = null;
+  anim.playing = false;
+  updateTransportUI();
+}
+
+function playClip(i) {
+  if (!anim.mixer || !anim.clips.length) return;
+  anim.index = clamp(i, 0, anim.clips.length - 1);
+  anim.mixer.stopAllAction();
+  anim.action = anim.mixer.clipAction(anim.clips[anim.index]);
+  anim.action.reset().play();
+  anim.playing = true;
+  updateTransportUI();
+  invalidate();
+}
+
+function setPlaying(on) {
+  if (!anim.action) return;
+  anim.playing = on;
+  anim.action.paused = !on;
+  updateTransportUI();
+  invalidate();
+}
+
+function seekTo(t) {
+  if (!anim.action) return;
+  anim.action.time = clamp(t, 0, anim.clips[anim.index].duration);
+  anim.mixer.update(0); // apply the pose at the new time even while paused
+  updateTransportTime();
+  invalidate();
+}
+
+function setSpeed(s) {
+  anim.speed = s;
+  if (anim.mixer) anim.mixer.timeScale = s;
+}
+
+// Called every frame from render(); advances the mixer while playing.
+function tickAnimation(dt) {
+  if (!anim.mixer || !anim.playing) return;
+  anim.mixer.update(dt);
+  invalidate(1);
+  const k = Math.floor(anim.action.time * 10); // throttle DOM writes to ~10 Hz
+  if (k !== _lastTick) {
+    _lastTick = k;
+    updateTransportTime();
+  }
+}
+
+function updateTransportTime() {
+  if (!anim.action) return;
+  const d = anim.clips[anim.index].duration;
+  const t = clamp(anim.action.time, 0, d);
+  const scrub = $('#anim-scrub');
+  if (document.activeElement !== scrub) scrub.value = t; // don't fight the user's drag
+  $('#anim-time').textContent = `${fmtTime(t)} / ${fmtTime(d)}`;
+}
+
+function updateTransportUI() {
+  const has = anim.clips.length > 0;
+  $('#anim-bar').hidden = !has;
+  const arBtn = document.querySelector('#ar-controls [data-ar="anim"]');
+  if (arBtn) {
+    arBtn.hidden = !has;
+    arBtn.textContent = anim.playing ? '⏸' : '▶';
+  }
+  if (!has) return;
+  const play = $('#anim-play');
+  play.textContent = anim.playing ? '⏸' : '▶';
+  play.setAttribute('aria-label', anim.playing ? 'Pause' : 'Play');
+  const sel = $('#anim-clip');
+  sel.innerHTML = '';
+  anim.clips.forEach((c, i) => {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `${c.name || `Clip ${i + 1}`} (${fmtTime(c.duration)})`;
+    sel.append(o);
+  });
+  sel.value = String(anim.index);
+  sel.hidden = anim.clips.length < 2;
+  const scrub = $('#anim-scrub');
+  scrub.max = anim.clips[anim.index].duration;
+  scrub.step = Math.max(anim.clips[anim.index].duration / 500, 0.001);
+  $('#anim-speed').value = String(anim.speed);
+  updateTransportTime();
+}
+
+function wireTransport() {
+  $('#anim-play').addEventListener('click', () => setPlaying(!anim.playing));
+  const scrub = $('#anim-scrub');
+  scrub.addEventListener('pointerdown', () => {
+    _scrubWasPlaying = anim.playing;
+    if (anim.playing) setPlaying(false); // pause while scrubbing
+  });
+  scrub.addEventListener('input', () => seekTo(parseFloat(scrub.value)));
+  scrub.addEventListener('change', () => {
+    if (_scrubWasPlaying) setPlaying(true);
+    _scrubWasPlaying = false;
+  });
+  $('#anim-clip').addEventListener('change', (e) => playClip(parseInt(e.target.value, 10)));
+  $('#anim-speed').addEventListener('change', (e) => setSpeed(parseFloat(e.target.value)));
+}
+
+// ===========================================================================
+// Deep links & sharing (URL + QR code)
+// ===========================================================================
+function setUrlModel(name) {
+  try {
+    const url = new URL(location.href);
+    if (name) url.searchParams.set('model', name);
+    else url.searchParams.delete('model');
+    history.replaceState(null, '', url);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function openShare() {
+  const url = location.href;
+  $('#share-url').value = url;
+  const box = $('#share-qr');
+  try {
+    const qr = qrcode(0, 'M'); // type 0 = auto-size, medium error correction
+    qr.addData(url);
+    qr.make();
+    box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch (e) {
+    box.textContent = 'Link is too long for a QR code — copy it instead.';
+  }
+  $('#share-copy').textContent = 'Copy';
+  $('#share-modal').hidden = false;
+}
+function closeShare() {
+  $('#share-modal').hidden = true;
+}
+async function copyShareUrl() {
+  const input = $('#share-url');
+  const btn = $('#share-copy');
+  try {
+    await navigator.clipboard.writeText(input.value);
+  } catch (e) {
+    input.select();
+    document.execCommand('copy');
+  }
+  btn.textContent = 'Copied ✓';
+  setTimeout(() => (btn.textContent = 'Copy'), 1500);
+}
+
+function wireShareAndTransport() {
+  $('#share-btn').addEventListener('click', openShare);
+  $('#share-close').addEventListener('click', closeShare);
+  $('#share-modal').querySelector('.modal-backdrop').addEventListener('click', closeShare);
+  $('#share-copy').addEventListener('click', copyShareUrl);
+  wireTransport();
+}
+
+// ===========================================================================
+// Model info panel
+// ===========================================================================
+function computeModelStats(group) {
+  let meshes = 0;
+  let skinned = 0;
+  let tris = 0;
+  let verts = 0;
+  let lights = 0;
+  const mats = new Set();
+  const texs = new Set();
+  group.traverse((o) => {
+    if (o.isLight) lights++;
+    if (!o.isMesh) return;
+    meshes++;
+    if (o.isSkinnedMesh) skinned++;
+    const g = o.geometry;
+    if (g) {
+      const pos = g.getAttribute('position');
+      const n = pos ? pos.count : 0;
+      verts += n;
+      tris += g.index ? g.index.count / 3 : n / 3;
+    }
+    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      if (!m) continue;
+      mats.add(m);
+      for (const k in m) if (m[k] && m[k].isTexture) texs.add(m[k]);
+    }
+  });
+  return { meshes, skinned, tris: Math.round(tris), verts, materials: mats.size, textures: texs.size, lights, clips: (group.animations || []).filter((c) => c && c.duration > 0).length };
+}
+
+function renderModelInfo(displayName, group, meta = {}) {
+  const sec = $('#sec-info');
+  sec.innerHTML = '';
+  if (!group) {
+    sec.append(el('div', 'muted', 'No model loaded.'));
+    return;
+  }
+  const row = (k, v) => {
+    const r = el('div', 'info-row');
+    r.append(el('span', 'info-key', k), el('span', 'info-val', v));
+    sec.append(r);
+  };
+  const s = computeModelStats(group);
+  const m = (v) => v.toFixed(3);
+  const cm = (v) => (v * 100).toFixed(1);
+  row('Name', displayName);
+  if (meta.extension) row('Format', String(meta.extension).toUpperCase());
+  if (meta.size != null) row('File size', formatSize(meta.size));
+  row('Size W × H × D', `${m(modelSize.x)} × ${m(modelSize.y)} × ${m(modelSize.z)} m`);
+  row('', `${cm(modelSize.x)} × ${cm(modelSize.y)} × ${cm(modelSize.z)} cm`);
+  row('Meshes', s.skinned ? `${s.meshes} (${s.skinned} skinned)` : String(s.meshes));
+  row('Triangles', s.tris.toLocaleString());
+  row('Vertices', s.verts.toLocaleString());
+  row('Materials / textures', `${s.materials} / ${s.textures}`);
+  if (s.lights) row('Embedded lights', String(s.lights));
+  row('Animation clips', String(s.clips));
+  sec.append(el('div', 'muted', 'Metres; the loader applies the file’s metersPerUnit and up-axis. Dimensions are the unscaled model.'));
 }
 
 // ===========================================================================
@@ -1037,7 +1298,18 @@ async function fetchModels({ autoload = false } = {}) {
     if (!models.length) {
       if (!currentInner) showEmpty('No models found', 'Add USD/USDA/USDC/USDZ files to the ./data directory and press Refresh — or drop a file here.');
     } else if (autoload && !activeModelName && !currentInner) {
-      selectModel(models[0]);
+      // Honour a ?model= deep link (exact name first, then accent/case-insensitive).
+      let wanted = null;
+      if (linkedModel) {
+        wanted =
+          models.find((m) => m.name === linkedModel) ||
+          models.find((m) => foldText(m.name) === foldText(linkedModel)) ||
+          null;
+      }
+      selectModel(wanted || models[0]);
+      if (linkedModel && !wanted) {
+        showError(`The linked model "${linkedModel}" is not in ./data — opened the first model instead.`);
+      }
     }
   } catch (err) {
     console.error('Failed to fetch models:', err);
@@ -1088,6 +1360,7 @@ function formatSize(bytes) {
 
 function selectModel(model) {
   activeModelName = model.name;
+  setUrlModel(model.name);
   // Reset model-specific transform; keep global lighting/environment settings.
   Object.assign(settings.transform, DEFAULT_TRANSFORM); // mutate in place — controls hold a ref to this object
   ar.yaw = 0;
@@ -1269,6 +1542,9 @@ function handleARAction(action) {
       ar.yaw = 0;
       if (ar.reticleVisible) reticle.matrix.decompose(ar.placePos, ar.placeQuat, _s); // snap back to the surface you're looking at
       break;
+    case 'anim':
+      setPlaying(!anim.playing);
+      return;
     case 'exit':
       renderer.xr.getSession()?.end();
       return;
@@ -1352,6 +1628,7 @@ function resizeToDisplay() {
 // a model swap, a resize. Idle frames cost nothing, which matters for battery
 // on Quest and phones. In an XR session every frame is drawn.
 function render(_time, frame) {
+  tickAnimation(clock.getDelta()); // getDelta() every frame so resuming never jumps
   if (renderer.xr.isPresenting) {
     if (frame) updateAR(frame);
     renderer.render(scene, camera);
@@ -1470,12 +1747,19 @@ function wireChrome() {
     if (e.key === 'Escape') {
       closeModels();
       closeSettingsDrawer();
+      closeShare();
       return;
     }
     if (isTypingTarget(e) || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'f' || e.key === 'F') fitCameraToObject(modelContainer);
+    // Space toggles playback (a focused <button> already handles Space itself).
+    if (e.code === 'Space' && anim.action && !(e.target instanceof HTMLButtonElement)) {
+      e.preventDefault();
+      setPlaying(!anim.playing);
+    }
   });
 
+  wireShareAndTransport();
   wireDragAndDrop();
 }
 
@@ -1483,6 +1767,7 @@ function wireChrome() {
 // Init
 // ===========================================================================
 buildSettingsUI();
+renderModelInfo(null);
 persistSections();
 wireChrome();
 setupARButton();
@@ -1491,4 +1776,4 @@ showEmpty('Loading model list…', 'Hang on a moment.');
 fetchModels({ autoload: true });
 
 // Expose a tiny hook for debugging / automated checks.
-window.__viewer = { scene, camera, renderer, settings, loadModel, loadLocalFile, get models() { return models; } };
+window.__viewer = { scene, camera, renderer, settings, anim, loadModel, loadLocalFile, get models() { return models; } };

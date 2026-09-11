@@ -325,6 +325,63 @@ button { font-family: inherit; }
 }
 .list-empty { padding: 24px 12px; text-align: center; color: var(--muted); font-size: 13px; }
 
+/* --------------------------- Animation transport --------------------------- */
+.anim-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 40px;
+  transform: translateX(-50%);
+  width: min(600px, calc(100% - 24px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px 6px 8px;
+  background: rgba(15, 17, 21, 0.8);
+  border: 1px solid var(--border-strong);
+  border-radius: 30px;
+  backdrop-filter: blur(6px);
+  z-index: 7;
+}
+.anim-bar input[type="range"] { flex: 1 1 auto; height: 22px; min-width: 80px; }
+.anim-time {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  min-width: 96px;
+  text-align: center;
+}
+.anim-select { width: auto; padding: 6px 26px 6px 8px; font-size: 12px; background-position: right 8px center; }
+
+/* ------------------------------ Share modal ------------------------------ */
+.modal-box-narrow { width: min(440px, 100%); }
+.share-body { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.share-qr {
+  width: 236px; height: 236px;
+  padding: 10px;
+  background: #fff;
+  border-radius: 10px;
+  color: #333;
+  font-size: 12px;
+  display: flex; align-items: center; justify-content: center; text-align: center;
+}
+.share-qr svg { width: 100%; height: 100%; display: block; }
+.share-link-row { display: flex; gap: 8px; width: 100%; }
+.share-link-row .search-input { flex: 1 1 auto; min-width: 0; }
+
+/* ------------------------------ Model info ------------------------------ */
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.info-key { color: var(--text-dim); flex: 0 0 auto; }
+.info-val { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
 /* ------------------------------ Controls ------------------------------ */
 .ctrl { display: flex; flex-direction: column; gap: 6px; }
 .ctrl-row {
@@ -586,6 +643,9 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 4px; }
   #settings-close { display: inline-flex; }
   .current-model { max-width: 34vw; }
   .viewer-hint { display: none; }
+  .anim-bar { bottom: 12px; gap: 6px; }
+  .anim-time { min-width: 0; }
+  #share-btn { display: none; } /* keep the phone topbar uncluttered; Share stays on desktop/Quest */
 }
 
 /* Larger hit targets on coarse pointers (touch / Quest controllers). */

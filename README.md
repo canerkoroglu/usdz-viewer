@@ -5,8 +5,11 @@ A lightweight, self-hosted web viewer for **USD / USDA / USDC / USDZ** 3D assets
 no database, no accounts.
 
 - Drop model files in `./data` — they are served **read-only**, never copied or modified.
-- Desktop: orbit / zoom / pan, full viewer-side lighting, shadows, environment and transform controls.
-- Quest: **Start AR** → passthrough → aim the reticle at a surface → trigger/pinch to place → scale / rotate / reset.
+- Desktop: orbit / zoom / pan, animation playback, full viewer-side lighting, shadows,
+  environment and transform controls, model statistics.
+- Quest: **Start AR** → passthrough → aim the reticle at a surface → trigger/pinch to place →
+  scale / rotate / play-pause / reset. Placement is true real-world scale (USD units are applied).
+- Share any model as a link or QR code (`/?model=chair.usdz`).
 
 ## Quick start
 
@@ -32,7 +35,7 @@ The container runs as a non-root user, restarts unless stopped, and exposes a he
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | `{"status":"ok","service":"usdz-viewer"}` |
-| `GET /api/models` | Metadata for every supported file in `./data` (name, extension, size, url). Sorted, Unicode-safe. |
+| `GET /api/models` | Metadata for every supported file in `./data` (name, extension, size, url). Sorted, Unicode-safe, never cached. |
 | `GET /models/<name>?v=<mtime>` | Streams one model (range requests supported, 1 h cache; the `v` query changes when the file changes). Strict path-traversal protection — only files directly inside `./data` with an allowed extension are served. |
 
 ## Running behind Nginx Proxy Manager (HTTPS)
@@ -41,7 +44,7 @@ WebXR only works in a **secure context**, so for the Quest you need HTTPS (or `l
 
 1. NPM → **Proxy Hosts → Add**: domain `3d.example.com`, scheme `http`, forward host = your Docker host IP, **forward port `8090`**. Enable *Block Common Exploits* and *Websockets Support*.
 2. **SSL** tab: request a Let's Encrypt certificate, enable *Force SSL* and *HTTP/2*.
-3. Open `https://3d.example.com` on the Quest.
+3. Open `https://3d.example.com` on the Quest — or press **Share** on the desktop and scan the QR code.
 
 The frontend uses only relative URLs, so nothing else needs configuring.
 
@@ -61,31 +64,46 @@ Open **http://localhost:8090** in the Quest Browser — `localhost` counts as a 
 |---|---|
 | Orbit / zoom / pan | Drag / scroll / right-drag (two-finger on touch) |
 | Fit camera to model | **F** key, double-click the viewer, or *Model transform → Fit camera* |
+| Play / pause animation | **Space**, the transport bar at the bottom (scrub, clip, speed), or the ▶/⏸ button in AR |
 | Pick a model | **▤ Models** button (search is accent-insensitive: `kucuk` finds *Küçük*) |
+| Open a specific model | `/?model=<filename>` — the URL updates as you switch models |
+| Share | **Share** button → link + QR code |
 | Preview a local file | Drag & drop a USD file onto the viewer (parsed in the browser, never uploaded) |
 | Close dialogs | **Esc** |
 
 All settings (lighting presets, lights, shadows, environment, ground, transform, quality, AR lighting)
-persist in `localStorage`; **Reset all** restores the Quest-friendly defaults.
+persist in `localStorage`; **Reset all** restores the Quest-friendly defaults. The *Model info* section
+shows dimensions (m / cm), mesh, triangle, material, texture and animation counts for the loaded file.
+
+## Development & tests
+
+```bash
+npm ci
+npm run dev                          # Vite dev server (frontend)
+DATA_DIR=./data node server.js       # API on http://localhost:8090
+npm test                             # server tests (Node's built-in runner, no extra deps)
+npm run build                        # production bundle -> dist/
+```
+
+CI (`.github/workflows/ci.yml`) runs the build, the test-suite and a Docker image build on every
+push and pull request.
 
 ## Project layout
 
 ```
-Dockerfile           multi-stage build (node:24-alpine), non-root runtime
-docker-compose.yml   service, read-only data mount, healthcheck
-server.js            Express 5 — API + traversal-safe streaming
-index.html           Vite entry (must stay at the project root)
-src/main.js          three.js viewer, settings UI, WebXR AR
-src/style.css        dark, responsive UI (sidebar on desktop, bottom sheet on phones)
-vite.config.js       build config
+Dockerfile              multi-stage build (node:24-alpine), non-root runtime
+docker-compose.yml      service, read-only data mount, healthcheck
+server.js               Express 5 — API + traversal-safe streaming (createApp() factory)
+test/server.test.js     HTTP + path-safety tests
+index.html              Vite entry (must stay at the project root)
+src/main.js             three.js viewer, settings UI, animation, WebXR AR
+src/style.css           dark, responsive UI (sidebar on desktop, bottom sheet on phones)
+vite.config.js          build config
 ```
-
-Local development without Docker: `npm ci`, then `npm run dev` for the Vite dev server and
-`DATA_DIR=./data node server.js` for the API on port 8090.
 
 ## Known limitations
 
-- USD **animation** and **material variants** load as static, default-variant geometry.
-- Up-axis is not auto-corrected — a Z-up file may appear rotated (use the rotation sliders).
+- USD **material variants** load with the file's default variant (switching variants is not exposed yet).
 - WebXR **light estimation** is used when the browser exposes it; otherwise the *AR lighting* mode is a manual fallback.
-- The viewer never writes to your model files. All lighting, shadow, ground and transform changes are viewer-side only.
+- Some USDC (binary crate) array types are skipped by three.js's parser with a console warning; such attributes are simply ignored.
+- The viewer never writes to your model files. All lighting, shadow, ground, transform and animation state is viewer-side only.

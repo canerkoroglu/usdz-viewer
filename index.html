@@ -28,6 +28,11 @@
         </div>
 
         <div class="settings-scroll">
+          <details class="section" id="details-info" open>
+            <summary>Model info</summary>
+            <div class="section-body" id="sec-info"></div>
+          </details>
+
           <details class="section" open>
             <summary>Presets</summary>
             <div class="section-body" id="sec-presets"></div>
@@ -82,6 +87,7 @@
           <button id="models-btn" class="btn btn-small" type="button" title="Browse models">▤&nbsp;Models</button>
           <span id="current-model" class="current-model" title="Change model" role="button" tabindex="0">No model selected</span>
           <div class="topbar-spacer"></div>
+          <button id="share-btn" class="btn btn-small" type="button" title="Share a link / QR code to this model">Share</button>
           <div id="ar-button-holder"></div>
         </div>
 
@@ -100,6 +106,20 @@
           <div id="error-banner" class="error-banner" role="alert" hidden>
             <span id="error-text"></span>
             <button id="error-close" class="btn btn-small" type="button">Dismiss</button>
+          </div>
+
+          <!-- Animation transport: shown only when the loaded USD has clips -->
+          <div id="anim-bar" class="anim-bar" hidden>
+            <button id="anim-play" class="btn btn-icon" type="button" aria-label="Pause" title="Play / pause (Space)">⏸</button>
+            <input id="anim-scrub" type="range" min="0" max="1" step="0.01" value="0" aria-label="Animation time" />
+            <span id="anim-time" class="anim-time">0.0 s / 0.0 s</span>
+            <select id="anim-clip" class="anim-select" aria-label="Animation clip" hidden></select>
+            <select id="anim-speed" class="anim-select" aria-label="Playback speed" title="Playback speed">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select>
           </div>
 
           <div id="viewer-hint" class="viewer-hint">Drag to orbit · scroll to zoom · right-drag to pan · double-click or F to fit</div>
@@ -126,6 +146,27 @@
       </div>
     </div>
 
+    <!-- ============================ SHARE MODAL ============================ -->
+    <div id="share-modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-box modal-box-narrow" role="dialog" aria-modal="true" aria-label="Share this model">
+        <header class="modal-header">
+          <div class="modal-title">Share this model</div>
+          <div class="modal-header-actions">
+            <button id="share-close" class="btn btn-icon" type="button" aria-label="Close">✕</button>
+          </div>
+        </header>
+        <div class="share-body">
+          <div id="share-qr" class="share-qr" role="img" aria-label="QR code of the link"></div>
+          <div class="share-link-row">
+            <input id="share-url" class="search-input" type="text" readonly aria-label="Link to this model" />
+            <button id="share-copy" class="btn btn-primary" type="button">Copy</button>
+          </div>
+          <div class="muted">Scan with a phone (or the Quest's passthrough QR scanner) to open exactly this model. The link uses the address you are on now — for the Quest, open the viewer through your HTTPS domain rather than localhost.</div>
+        </div>
+      </div>
+    </div>
+
     <!-- ===================== AR DOM OVERLAY (WebXR) ===================== -->
     <!-- Hidden until an AR session starts; three.js ARButton toggles inline display. -->
     <div id="ar-overlay" style="display: none">
@@ -134,6 +175,7 @@
         <button data-ar="scale-down" class="ar-btn" type="button">−</button>
         <button data-ar="scale-up" class="ar-btn" type="button">+</button>
         <button data-ar="rotate" class="ar-btn" type="button">⟳</button>
+        <button data-ar="anim" class="ar-btn" type="button" hidden aria-label="Play / pause animation">⏸</button>
         <button data-ar="reset" class="ar-btn" type="button">Reset</button>
         <button data-ar="exit" class="ar-btn ar-btn-exit" type="button">Exit AR</button>
       </div>
