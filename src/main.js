@@ -45,6 +45,23 @@ const MODEL_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
 // Deep link: /?model=<filename> opens that model directly (see fetchModels).
 const linkedModel = new URLSearchParams(location.search).get('model');
 
+// Gallery view state (grid/list, sort, format filter) — persisted separately
+// from the render settings so "Reset all" leaves it alone.
+const GALLERY_KEY = 'usdz-viewer.gallery.v1';
+const gallery = { view: 'grid', sort: 'name', dir: 'asc', format: 'all' };
+try {
+  Object.assign(gallery, JSON.parse(localStorage.getItem(GALLERY_KEY) || '{}'));
+} catch (e) {
+  /* ignore */
+}
+function saveGallery() {
+  try {
+    localStorage.setItem(GALLERY_KEY, JSON.stringify(gallery));
+  } catch (e) {
+    /* ignore */
+  }
+}
+
 const TONE_MAPPING = {
   none: { label: 'None', value: NoToneMapping },
   neutral: { label: 'Neutral', value: NeutralToneMapping },
@@ -889,6 +906,7 @@ function installGroup(group, displayName, meta = {}) {
   fitCameraToObject(modelContainer);
   setupAnimation(group);
   renderModelInfo(displayName, group, meta);
+  if (meta.thumbKey && !ar.active) maybeRequestThumbnail(meta.thumbKey, meta.thumbVersion);
   loadedModelName = displayName;
   setCurrentModelName(displayName);
   setLoading(false);
@@ -933,7 +951,7 @@ async function loadModel(model) {
       return;
     }
     setLoading(true, `Preparing ${model.name}…`);
-    installGroup(group, model.name, { size: model.size, extension: model.extension });
+    installGroup(group, model.name, { size: model.size, extension: model.extension, thumbKey: model.name, thumbVersion: model.modified });
   } catch (err) {
     onLoadFailed(err, model.name, token);
   }
@@ -1320,36 +1338,357 @@ async function fetchModels({ autoload = false } = {}) {
   }
 }
 
+// ---- Preview thumbnails ---------------------------------------------------
+// Captured from the live canvas the first time a model is viewed (never by
+// preloading the whole library) and kept in IndexedDB keyed by filename,
+// versioned by the file's mtime so a re-exported model gets a fresh preview.
+const THUMB_W = 320;
+const THUMB_H = 240;
+const thumbs = new Map(); // name -> { v, dataUrl, at }
+const thumbWaiters = new Map(); // name -> resolve() (used by "Generate previews")
+let thumbPending = null; // { name, version, framesLeft }
+
+let _thumbDbPromise = null;
+function thumbDb() {
+  if (_thumbDbPromise) return _thumbDbPromise;
+  _thumbDbPromise = new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('usdz-viewer', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('thumbs');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch (e) {
+      resolve(null); // e.g. storage disabled — previews just won't persist
+    }
+  });
+  return _thumbDbPromise;
+}
+
+async function thumbLoadAll() {
+  const db = await thumbDb();
+  if (!db) return;
+  await new Promise((resolve) => {
+    try {
+      const req = db.transaction('thumbs', 'readonly').objectStore('thumbs').openCursor();
+      req.onsuccess = () => {
+        const c = req.result;
+        if (c) {
+          thumbs.set(c.key, c.value);
+          c.continue();
+        } else resolve();
+      };
+      req.onerror = () => resolve();
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+async function thumbSave(name, entry) {
+  thumbs.set(name, entry);
+  const db = await thumbDb();
+  if (db) {
+    try {
+      db.transaction('thumbs', 'readwrite').objectStore('thumbs').put(entry, name);
+    } catch (e) {
+      /* quota / private mode — keep the in-memory copy */
+    }
+  }
+  const waiter = thumbWaiters.get(name);
+  if (waiter) {
+    thumbWaiters.delete(name);
+    waiter();
+  }
+}
+
+const hasFreshThumb = (m) => {
+  const t = thumbs.get(m.name);
+  return !!(t && t.dataUrl && t.v === m.modified);
+};
+
+function maybeRequestThumbnail(name, version) {
+  const t = thumbs.get(name);
+  if (t && t.dataUrl && t.v === version) return;
+  thumbPending = { name, version, framesLeft: 2 }; // capture once the fitted view has been drawn
+  invalidate(3);
+}
+
+// Must run synchronously right after renderer.render() — the WebGL drawing
+// buffer is only guaranteed intact until the current task ends.
+function captureThumbnail() {
+  const glCanvas = renderer.domElement;
+  const c = document.createElement('canvas');
+  c.width = THUMB_W;
+  c.height = THUMB_H;
+  const ctx = c.getContext('2d');
+  const sw = glCanvas.width;
+  const sh = glCanvas.height;
+  const aspect = THUMB_W / THUMB_H;
+  let cw = sw;
+  let ch = sh;
+  if (sw / sh > aspect) cw = Math.round(sh * aspect);
+  else ch = Math.round(sw / aspect);
+  ctx.drawImage(glCanvas, Math.round((sw - cw) / 2), Math.round((sh - ch) / 2), cw, ch, 0, 0, THUMB_W, THUMB_H); // centre crop
+  return c.toDataURL('image/jpeg', 0.82);
+}
+
+// Called from the render loop right after a frame was drawn.
+function afterFrameDrawn() {
+  if (!thumbPending || renderer.xr.isPresenting) return;
+  if (--thumbPending.framesLeft > 0) return;
+  const { name, version } = thumbPending;
+  thumbPending = null;
+  try {
+    const dataUrl = captureThumbnail();
+    thumbSave(name, { v: version, dataUrl, at: Date.now() }).then(() => {
+      if (!$('#models-modal').hidden) renderModelList();
+    });
+  } catch (e) {
+    console.warn('Preview capture failed:', e);
+    const waiter = thumbWaiters.get(name);
+    if (waiter) {
+      thumbWaiters.delete(name);
+      waiter();
+    }
+  }
+}
+
+// ---- "Generate previews" (explicit, user-initiated, cancellable) ----------
+const genState = { running: false, cancel: false };
+
+function loadModelAndCapture(m) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      thumbWaiters.delete(m.name);
+      resolve();
+    }, 20000); // safety net (e.g. tab hidden → no frames)
+    thumbWaiters.set(m.name, () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    activeModelName = m.name;
+    loadModel(m).then(() => {
+      if (loadedModelName !== m.name) {
+        // load failed — nothing will be captured
+        thumbWaiters.delete(m.name);
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+  });
+}
+
+async function generateAllPreviews() {
+  if (genState.running) return;
+  const status = $('#gen-status');
+  const text = $('#gen-text');
+  const bar = $('#gen-bar');
+  const todo = models.filter((m) => !hasFreshThumb(m));
+  if (!todo.length) {
+    text.textContent = 'All previews are up to date.';
+    bar.style.width = '100%';
+    status.hidden = false;
+    setTimeout(() => (status.hidden = true), 1800);
+    return;
+  }
+  genState.running = true;
+  genState.cancel = false;
+  $('#gen-previews').disabled = true;
+  status.hidden = false;
+  const restore = loadedModelName;
+  let done = 0;
+  for (const m of todo) {
+    if (genState.cancel) break;
+    text.textContent = `Generating previews ${done + 1} / ${todo.length} — ${m.name}`;
+    bar.style.width = `${Math.round((done / todo.length) * 100)}%`;
+    await loadModelAndCapture(m);
+    done++;
+    renderModelList();
+  }
+  bar.style.width = '100%';
+  text.textContent = genState.cancel ? `Stopped after ${done} of ${todo.length}.` : `Done — ${done} preview${done === 1 ? '' : 's'} generated.`;
+  setTimeout(() => (status.hidden = true), 2200);
+  genState.running = false;
+  $('#gen-previews').disabled = false;
+  // Put the model the user was looking at back on stage (gallery stays open).
+  const back = models.find((m) => m.name === restore);
+  if (back && loadedModelName !== back.name) {
+    activeModelName = back.name;
+    loadModel(back);
+    renderModelList();
+  }
+}
+
+// ---- Gallery rendering -----------------------------------------------------
+function relTime(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '';
+  const min = Math.round(ms / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const h = Math.round(min / 60);
+  if (h < 48) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  if (d < 60) return `${d} d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
+const SORTERS = {
+  name: byName,
+  size: (a, b) => a.size - b.size || byName(a, b),
+  modified: (a, b) => new Date(a.modified) - new Date(b.modified) || byName(a, b),
+  extension: (a, b) => a.extension.localeCompare(b.extension) || byName(a, b),
+};
+
+function visibleModels() {
+  const q = foldText($('#model-search')?.value || '').trim();
+  const dir = gallery.dir === 'desc' ? -1 : 1;
+  const sorter = SORTERS[gallery.sort] || byName;
+  return models
+    .filter((m) => (gallery.format === 'all' || m.extension === gallery.format) && (!q || foldText(m.name).includes(q)))
+    .sort((a, b) => sorter(a, b) * dir);
+}
+
+function syncGalleryToolbar() {
+  document.querySelectorAll('.gallery-toolbar [data-view]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.view === gallery.view);
+    b.setAttribute('aria-pressed', b.dataset.view === gallery.view ? 'true' : 'false');
+  });
+  document.querySelectorAll('.gallery-toolbar [data-sort]').forEach((b) => {
+    const on = b.dataset.sort === gallery.sort;
+    b.classList.toggle('active', on);
+    b.textContent = on ? `${b.dataset.label} ${gallery.dir === 'asc' ? '▲' : '▼'}` : b.dataset.label;
+  });
+  const counts = {};
+  for (const m of models) counts[m.extension] = (counts[m.extension] || 0) + 1;
+  if (gallery.format !== 'all' && !counts[gallery.format]) gallery.format = 'all';
+  const chips = $('#format-chips');
+  chips.innerHTML = '';
+  const chip = (key, label, n) => {
+    const b = el('button', `seg-btn${gallery.format === key ? ' active' : ''}`, `${label} ${n}`);
+    b.type = 'button';
+    b.dataset.format = key;
+    chips.append(b);
+  };
+  chip('all', 'All', models.length);
+  for (const ext of MODEL_EXTENSIONS) if (counts[ext]) chip(ext, ext.toUpperCase(), counts[ext]);
+}
+
+function updateGallerySummary(visible) {
+  const total = models.reduce((s, m) => s + m.size, 0);
+  const withPreview = models.filter(hasFreshThumb).length;
+  const parts = [];
+  if (models.length) parts.push(visible.length === models.length ? `${models.length} models` : `${visible.length} of ${models.length} shown`);
+  if (models.length) parts.push(formatSize(total));
+  if (models.length) parts.push(`${withPreview}/${models.length} previews`);
+  $('#gallery-summary').textContent = parts.join(' · ');
+}
+
+function buildCard(m) {
+  const card = el('button', 'model-card');
+  card.type = 'button';
+  card.setAttribute('role', 'option');
+  card.dataset.name = m.name;
+  card.title = `${m.name}\n${formatSize(m.size)} · ${new Date(m.modified).toLocaleString()}`;
+  const isActive = m.name === activeModelName;
+  if (isActive) {
+    card.classList.add('active');
+    card.setAttribute('aria-selected', 'true');
+  }
+
+  const thumb = el('div', 'card-thumb');
+  const t = thumbs.get(m.name);
+  if (t && t.dataUrl) {
+    const img = document.createElement('img');
+    img.alt = '';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.src = t.dataUrl;
+    thumb.append(img);
+  } else {
+    const ph = el('div', 'ph', m.extension.toUpperCase());
+    ph.append(el('small', null, 'no preview yet'));
+    thumb.append(ph);
+  }
+  if (isActive) thumb.append(el('span', 'card-badge', 'Viewing'));
+
+  const body = el('div', 'card-body');
+  body.append(el('div', 'card-name', m.name));
+  const meta = el('div', 'card-meta');
+  meta.append(el('span', 'ext', m.extension), el('span', null, formatSize(m.size)), el('span', null, relTime(m.modified)));
+  body.append(meta);
+
+  card.append(thumb, body);
+  card.addEventListener('click', () => selectModel(m));
+  return card;
+}
+
 function renderModelList() {
   const listEl = $('#model-list');
+  listEl.className = `model-list ${gallery.view === 'list' ? 'gallery-list' : 'gallery-grid'}`;
   listEl.innerHTML = '';
+  syncGalleryToolbar();
   if (!models.length) {
     listEl.appendChild(el('div', 'list-empty', 'No models in ./data'));
+    updateGallerySummary([]);
     return;
   }
-  const query = foldText($('#model-search')?.value || '').trim();
-  const visible = query ? models.filter((m) => foldText(m.name).includes(query)) : models;
+  const visible = visibleModels();
   if (!visible.length) {
-    listEl.appendChild(el('div', 'list-empty', `No models match "${$('#model-search').value}"`));
+    listEl.appendChild(el('div', 'list-empty', 'No models match the current search / filter.'));
+    updateGallerySummary(visible);
     return;
   }
-  for (const m of visible) {
-    const item = el('button', 'model-item');
-    item.type = 'button';
-    item.setAttribute('role', 'option');
-    item.title = m.name;
-    if (m.name === activeModelName) {
-      item.classList.add('active');
-      item.setAttribute('aria-selected', 'true');
-    }
-    const name = el('div', 'model-item-name', m.name);
-    const meta = el('div', 'model-item-meta');
-    const ext = el('span', 'ext', m.extension);
-    meta.append(ext, document.createTextNode(` · ${formatSize(m.size)}`));
-    item.append(name, meta);
-    item.addEventListener('click', () => selectModel(m));
-    listEl.append(item);
-  }
+  for (const m of visible) listEl.append(buildCard(m));
+  updateGallerySummary(visible);
+}
+
+function wireGallery() {
+  document.querySelectorAll('.gallery-toolbar [data-view]').forEach((b) =>
+    b.addEventListener('click', () => {
+      gallery.view = b.dataset.view;
+      saveGallery();
+      renderModelList();
+    })
+  );
+  document.querySelectorAll('.gallery-toolbar [data-sort]').forEach((b) =>
+    b.addEventListener('click', () => {
+      if (gallery.sort === b.dataset.sort) gallery.dir = gallery.dir === 'asc' ? 'desc' : 'asc';
+      else {
+        gallery.sort = b.dataset.sort;
+        gallery.dir = b.dataset.sort === 'size' || b.dataset.sort === 'modified' ? 'desc' : 'asc';
+      }
+      saveGallery();
+      renderModelList();
+    })
+  );
+  $('#format-chips').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-format]');
+    if (!b) return;
+    gallery.format = b.dataset.format;
+    saveGallery();
+    renderModelList();
+  });
+  $('#gen-previews').addEventListener('click', generateAllPreviews);
+  $('#gen-cancel').addEventListener('click', () => {
+    genState.cancel = true;
+  });
+  // Arrow keys move between cards (Enter/Space activate the focused card natively).
+  $('#model-list').addEventListener('keydown', (e) => {
+    const listEl = $('#model-list');
+    const cards = [...listEl.querySelectorAll('.model-card')];
+    const i = cards.indexOf(document.activeElement);
+    if (i < 0 || !cards.length) return;
+    const cols = gallery.view === 'list' ? 1 : Math.max(1, Math.round(listEl.clientWidth / (cards[0].offsetWidth + 10)));
+    const delta = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: cols, ArrowUp: -cols }[e.key];
+    if (delta === undefined) return;
+    e.preventDefault();
+    const j = clamp(i + delta, 0, cards.length - 1);
+    cards[j].focus();
+    cards[j].scrollIntoView({ block: 'nearest' });
+  });
 }
 
 function formatSize(bytes) {
@@ -1639,6 +1978,7 @@ function render(_time, frame) {
   if (framesToRender <= 0) return;
   framesToRender--;
   renderer.render(scene, camera);
+  afterFrameDrawn();
 }
 renderer.setAnimationLoop(render);
 
@@ -1665,6 +2005,7 @@ window.addEventListener('focus', () => invalidate());
 // visible while sliders are dragged.
 function openModels() {
   $('#models-modal').hidden = false;
+  renderModelList(); // pick up previews captured while the dialog was closed
   const search = $('#model-search');
   // Only auto-focus with a real keyboard — on touch/Quest it would pop the OSK.
   if (search && window.matchMedia('(pointer: fine)').matches) {
@@ -1760,6 +2101,7 @@ function wireChrome() {
   });
 
   wireShareAndTransport();
+  wireGallery();
   wireDragAndDrop();
 }
 
@@ -1773,7 +2115,7 @@ wireChrome();
 setupARButton();
 applyAll();
 showEmpty('Loading model list…', 'Hang on a moment.');
-fetchModels({ autoload: true });
+thumbLoadAll().finally(() => fetchModels({ autoload: true })); // previews first so cards render with images
 
 // Expose a tiny hook for debugging / automated checks.
-window.__viewer = { scene, camera, renderer, settings, anim, loadModel, loadLocalFile, get models() { return models; } };
+window.__viewer = { scene, camera, renderer, settings, anim, gallery, thumbs, loadModel, loadLocalFile, generateAllPreviews, get models() { return models; } };

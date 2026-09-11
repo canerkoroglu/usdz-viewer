@@ -127,12 +127,12 @@
       </main>
     </div>
 
-    <!-- ======================= MODEL SELECTION MODAL ======================= -->
+    <!-- ======================= MODEL GALLERY MODAL ======================= -->
     <div id="models-modal" hidden>
       <div class="modal-backdrop" data-close="1"></div>
-      <div class="modal-box" role="dialog" aria-modal="true" aria-label="Select a model">
+      <div class="modal-box modal-box-wide" role="dialog" aria-modal="true" aria-label="Select a model">
         <header class="modal-header">
-          <div class="modal-title">Select model <span id="model-count" class="pill">0</span></div>
+          <div class="modal-title">Models <span id="model-count" class="pill">0</span></div>
           <div class="modal-header-actions">
             <button id="refresh-btn" class="btn btn-small" type="button" title="Rescan data directory">↻ Refresh</button>
             <button id="models-close" class="btn btn-icon" type="button" aria-label="Close">✕</button>
@@ -141,8 +141,28 @@
         <div class="modal-search">
           <input id="model-search" class="search-input" type="search" placeholder="Search models… (accent-insensitive)" autocomplete="off" spellcheck="false" aria-label="Search models" />
         </div>
-        <div id="model-list" class="model-list" role="listbox" aria-label="Available models"></div>
-        <footer class="modal-footer"><span id="data-note" class="muted"></span></footer>
+        <div class="gallery-toolbar">
+          <div class="seg" role="group" aria-label="View">
+            <button class="seg-btn" data-view="grid" type="button" title="Grid view" aria-label="Grid view">▦</button>
+            <button class="seg-btn" data-view="list" type="button" title="List view" aria-label="List view">☰</button>
+          </div>
+          <div class="seg" role="group" aria-label="Sort by">
+            <button class="seg-btn" data-sort="name" data-label="Name" type="button">Name</button>
+            <button class="seg-btn" data-sort="size" data-label="Size" type="button">Size</button>
+            <button class="seg-btn" data-sort="modified" data-label="Date" type="button">Date</button>
+            <button class="seg-btn" data-sort="extension" data-label="Type" type="button">Type</button>
+          </div>
+          <div class="seg" role="group" aria-label="Format" id="format-chips"></div>
+          <div class="toolbar-spacer"></div>
+          <button id="gen-previews" class="btn btn-small" type="button" title="Loads each model without a preview once, captures a thumbnail, and moves on">Generate previews</button>
+        </div>
+        <div id="gen-status" class="gen-status" hidden>
+          <span id="gen-text"></span>
+          <span class="bar"><i id="gen-bar"></i></span>
+          <button id="gen-cancel" class="btn btn-small" type="button">Cancel</button>
+        </div>
+        <div id="model-list" class="model-list gallery-grid" role="listbox" aria-label="Available models"></div>
+        <footer class="modal-footer"><span id="gallery-summary" class="muted"></span><span id="data-note" class="muted"></span></footer>
       </div>
     </div>
 

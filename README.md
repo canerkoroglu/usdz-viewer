@@ -9,6 +9,7 @@ no database, no accounts.
   environment and transform controls, model statistics.
 - Quest: **Start AR** → passthrough → aim the reticle at a surface → trigger/pinch to place →
   scale / rotate / play-pause / reset. Placement is true real-world scale (USD units are applied).
+- Model gallery with preview thumbnails, sorting, format filters and search.
 - Share any model as a link or QR code (`/?model=chair.usdz`).
 
 ## Quick start
@@ -65,7 +66,8 @@ Open **http://localhost:8090** in the Quest Browser — `localhost` counts as a 
 | Orbit / zoom / pan | Drag / scroll / right-drag (two-finger on touch) |
 | Fit camera to model | **F** key, double-click the viewer, or *Model transform → Fit camera* |
 | Play / pause animation | **Space**, the transport bar at the bottom (scrub, clip, speed), or the ▶/⏸ button in AR |
-| Pick a model | **▤ Models** button (search is accent-insensitive: `kucuk` finds *Küçük*) |
+| Pick a model | **▤ Models** gallery — grid or list, sort by name / size / date / type, format filters, accent-insensitive search (`kucuk` finds *Küçük*), arrow keys move between cards |
+| Preview thumbnails | Captured automatically the first time a model is viewed and cached in the browser (IndexedDB, refreshed when the file changes). **Generate previews** runs a one-off pass over models that have none — nothing is preloaded otherwise |
 | Open a specific model | `/?model=<filename>` — the URL updates as you switch models |
 | Share | **Share** button → link + QR code |
 | Preview a local file | Drag & drop a USD file onto the viewer (parsed in the browser, never uploaded) |
