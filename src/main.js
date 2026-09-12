@@ -25,13 +25,19 @@ import {
   PCFShadowMap,
   ColorManagement,
   AnimationMixer,
+  FileLoader,
+  DefaultLoadingManager,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
-import { USDLoader } from 'three/addons/loaders/USDLoader.js';
+import { USDAParser } from 'three/addons/loaders/usd/USDAParser.js';
+import { USDCParser } from 'three/addons/loaders/usd/USDCParser.js';
+import { USDComposer } from 'three/addons/loaders/usd/USDComposer.js';
+import { unzipSync } from 'three/addons/libs/fflate.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import qrcode from 'qrcode-generator';
+import { applyMaterialXFallbacks, clearMaterialXCache } from './mtlx.js';
 
 import './style.css';
 
@@ -809,7 +815,6 @@ function resetAllSettings() {
 // ===========================================================================
 // Model loading
 // ===========================================================================
-const loader = new USDLoader();
 const _box = new Box3();
 const _sphere = new Sphere();
 let embeddedLights = [];
@@ -923,7 +928,7 @@ function installGroup(group, displayName, meta = {}) {
   detectEmbeddedLights(group);
   applyTransform(); // also re-rigs lights, ground and the shadow camera for the new size
   applyGround();
-  fitCameraToObject(modelContainer);
+  if (!meta.keepCamera) fitCameraToObject(modelContainer);
   setupAnimation(group);
   renderModelInfo(displayName, group, meta);
   if (meta.thumbKey && !ar.active) maybeRequestThumbnail(meta.thumbKey, meta.thumbVersion);
@@ -956,35 +961,232 @@ function onLoadFailed(err, name, token) {
 
 const formatPct = (e) => (e && e.lengthComputable && e.total > 0 ? ` ${Math.round((e.loaded / e.total) * 100)}%` : '');
 
+// ---- USD parsing ------------------------------------------------------------
+// Mirrors USDLoader.parse() using the same parsers/composer, but exposes the
+// composer's variant-selection argument and enumerates the file's variant sets.
+const fileLoader = new FileLoader().setResponseType('arraybuffer');
+const CRATE_MAGIC = [0x50, 0x58, 0x52, 0x2d, 0x55, 0x53, 0x44, 0x43]; // "PXR-USDC"
+const isCrate = (u8) => u8.byteLength >= 8 && CRATE_MAGIC.every((b, i) => u8[i] === b);
+const lowerExt = (name) => {
+  const d = name.lastIndexOf('.');
+  const s = name.lastIndexOf('/');
+  return d < 0 || s > d ? '' : name.slice(d + 1).toLowerCase();
+};
+const asArrayBuffer = (u8) =>
+  u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength ? u8.buffer : u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+
+// Variant sets: a prim lists its sets in fields.variantSetChildren, the options
+// live on "<prim>/{set=}" (fields.variantChildren) and the file's own choice in
+// fields.variantSelection. Selections are global per set name (as the composer
+// applies them), so identically named sets on several prims switch together.
+function enumerateVariants(parsed) {
+  const specs = parsed?.specsByPath || {};
+  const sets = new Map();
+  for (const path in specs) {
+    const f = specs[path]?.fields;
+    if (!f?.variantSetChildren) continue;
+    for (const setName of f.variantSetChildren) {
+      const entry = sets.get(setName) || { name: setName, options: new Set(), selected: null };
+      for (const o of specs[`${path}/{${setName}=}`]?.fields?.variantChildren || []) entry.options.add(o);
+      if (!entry.selected && f.variantSelection?.[setName]) entry.selected = f.variantSelection[setName];
+      sets.set(setName, entry);
+    }
+  }
+  return [...sets.values()]
+    .map((s) => ({ name: s.name, options: [...s.options], selected: s.selected || [...s.options][0] || null }))
+    .filter((s) => s.options.length > 1);
+}
+
+// USD material-binding strength: a binding authored on an ancestor prim with
+// bindMaterialAs = "strongerThanDescendants" overrides the bindings of every
+// mesh below it. three's composer resolves each mesh's own binding only, so
+// variants that switch materials this way (a common exporter pattern) would
+// fall back to placeholder materials. Propagate such bindings down to the Mesh
+// descendants in the spec table before composing.
+const stripVariantSegments = (p) => p.replace(/\/\{[^}]*\}/g, '');
+function propagateStrongBindings(specs) {
+  if (!specs) return;
+  const REL = '.material:binding';
+  const strong = [];
+  for (const k in specs) {
+    if (!k.endsWith(REL)) continue;
+    const fields = specs[k]?.fields;
+    if (fields?.bindMaterialAs === 'strongerThanDescendants' && fields.targetPaths?.length) {
+      strong.push({ prim: k.slice(0, -REL.length), spec: specs[k] });
+    }
+  }
+  if (!strong.length) return;
+  strong.sort((a, b) => b.prim.length - a.prim.length); // deepest ancestor wins
+  const isPrimKey = (k) => !k.slice(k.lastIndexOf('/')).includes('.');
+  const isMesh = (k) => specs[k]?.fields?.typeName === 'Mesh' || specs[stripVariantSegments(k)]?.fields?.typeName === 'Mesh';
+  for (const k in specs) {
+    if (!isPrimKey(k)) continue;
+    const anc = strong.find((a) => k.startsWith(a.prim + '/'));
+    if (!anc || !isMesh(k)) continue;
+    specs[k + REL] = { ...anc.spec, fields: { ...anc.spec.fields, bindMaterialAs: 'weakerThanDescendants' } };
+    const props = specs[k].fields?.properties;
+    if (Array.isArray(props) && !props.includes('material:binding')) specs[k].fields.properties = [...props, 'material:binding'];
+  }
+}
+
+// Synchronous compose; textures resolve through the returned promise.
+function composeUSD(buffer, variantSelections = {}) {
+  const usda = new USDAParser();
+  const usdc = new USDCParser();
+  const decoder = new TextDecoder();
+  const bytes = new Uint8Array(buffer);
+  let data;
+  const assets = {};
+  let basePath = '';
+  if (isCrate(bytes)) {
+    data = usdc.parseData(buffer);
+  } else if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    const zip = unzipSync(bytes);
+    const names = Object.keys(zip);
+    if (!names.length) throw new Error('Empty USDZ archive');
+    for (const name of names) {
+      const ext = lowerExt(name);
+      const fb = zip[name];
+      if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'avif') {
+        assets[name] = fb; // raw image bytes; the composer creates object URLs lazily
+        continue;
+      }
+      if (ext !== 'usd' && ext !== 'usda' && ext !== 'usdc') continue;
+      assets[name] = isCrate(fb) ? usdc.parseData(asArrayBuffer(fb)) : usda.parseData(decoder.decode(fb));
+    }
+    const first = names[0]; // per the USDZ spec the first entry is the root layer
+    const slash = first.lastIndexOf('/');
+    basePath = slash >= 0 ? first.slice(0, slash) : '';
+    data = assets[first];
+    if (!data) throw new Error(`Invalid USDZ package: the first entry ("${first}") must be a USD layer.`);
+  } else {
+    data = usda.parseData(decoder.decode(bytes));
+  }
+  propagateStrongBindings(data?.specsByPath);
+  _lastParsedData = data;
+  const composer = new USDComposer(DefaultLoadingManager);
+  const group = composer.compose(data, assets, variantSelections, basePath);
+  return { group, variants: enumerateVariants(data), ready: Promise.all(composer.texturePromises || []), data, assets, basePath };
+}
+
+// Parse off the current task (so the "Loading…" text paints first) and wait
+// for the textures.
+async function parseBuffer(buffer, variantSelections = {}) {
+  await new Promise((r) => setTimeout(r, 20));
+  const result = composeUSD(buffer, variantSelections);
+  await result.ready;
+  // Materials driven by MaterialX node graphs (procedural recolours etc.) are
+  // beyond the composer; bake them to textures so variants render correctly.
+  try {
+    const effective = Object.fromEntries(result.variants.map((v) => [v.name, variantSelections[v.name] || v.selected]));
+    const { applied, notes } = await applyMaterialXFallbacks(result.group, result.data?.specsByPath, result.assets, effective, result.basePath, (msg) => setLoading(true, msg));
+    result.materialNotes = notes;
+    if (applied) console.info(`MaterialX: baked ${applied} texture map${applied === 1 ? '' : 's'} the composer could not resolve.`);
+    for (const note of notes) console.info('MaterialX:', note);
+  } catch (e) {
+    console.warn('MaterialX fallback failed:', e);
+  }
+  return result;
+}
+
+// The source of the model on stage, kept so variants can be switched without
+// a re-download. Cleared whenever another model starts loading.
+const source = { buffer: null, name: null, meta: null, variants: [], selections: {}, notes: [] };
+let _lastParsedData = null; // root layer of the last compose (debug/inspection)
+function rememberSource(buffer, name, meta, variants, notes = []) {
+  source.notes = notes;
+  source.buffer = buffer;
+  source.name = name;
+  source.meta = meta;
+  source.variants = variants;
+  source.selections = Object.fromEntries(variants.map((v) => [v.name, v.selected]));
+  renderVariantsUI();
+}
+function forgetSource() {
+  clearMaterialXCache();
+  source.buffer = null;
+  source.name = null;
+  source.meta = null;
+  source.variants = [];
+  source.selections = {};
+  source.notes = [];
+  renderVariantsUI();
+}
+
 let loadToken = 0;
 async function loadModel(model) {
   const token = ++loadToken;
+  forgetSource();
   setLoading(true, `Loading ${model.name}…`);
   clearError();
   hideEmpty();
   try {
-    const group = await loader.loadAsync(model.url, (e) => {
+    const buffer = await fileLoader.loadAsync(model.url, (e) => {
       if (token === loadToken) setLoading(true, `Loading ${model.name}…${formatPct(e)}`);
     });
+    if (token !== loadToken) return; // a newer selection superseded this one
+    setLoading(true, `Preparing ${model.name}…`);
+    const parsed = await parseBuffer(buffer);
     if (token !== loadToken) {
-      disposeGroup(group); // a newer selection superseded this one
+      disposeGroup(parsed.group);
       return;
     }
-    setLoading(true, `Preparing ${model.name}…`);
-    installGroup(group, model.name, { size: model.size, extension: model.extension, thumbKey: model.name, thumbVersion: model.modified });
+    const meta = { size: model.size, extension: model.extension, thumbKey: model.name, thumbVersion: model.modified };
+    rememberSource(buffer, model.name, meta, parsed.variants, parsed.materialNotes); // before install so Model info sees the sets
+    installGroup(parsed.group, model.name, meta);
   } catch (err) {
     onLoadFailed(err, model.name, token);
   }
 }
 
-// Parse an in-memory USD/USDZ buffer (used for local drag-and-drop files).
-function parseBuffer(buffer) {
-  return new Promise((resolve, reject) => {
-    try {
-      loader.parse(buffer, '', resolve, reject);
-    } catch (e) {
-      reject(e);
+// Re-compose the current model with a different variant selection.
+async function applyVariant(setName, option) {
+  if (!source.buffer) return;
+  const token = ++loadToken;
+  source.selections = { ...source.selections, [setName]: option };
+  setLoading(true, `Switching ${setName} → ${option}…`);
+  clearError();
+  try {
+    const parsed = await parseBuffer(source.buffer, source.selections);
+    if (token !== loadToken) {
+      disposeGroup(parsed.group);
+      return;
     }
+    source.variants = parsed.variants.map((v) => ({ ...v, selected: source.selections[v.name] || v.selected }));
+    source.notes = parsed.materialNotes || [];
+    renderVariantsUI();
+    installGroup(parsed.group, source.name, { ...source.meta, thumbKey: undefined, keepCamera: true });
+  } catch (err) {
+    onLoadFailed(err, source.name, token);
+  }
+}
+
+function renderVariantsUI() {
+  const sec = $('#sec-variants');
+  const details = $('#details-variants');
+  sec.innerHTML = '';
+  for (const k of Object.keys(ui)) if (k.startsWith('var-')) delete ui[k];
+  const sets = source.variants;
+  if (!sets.length) {
+    details.hidden = true;
+    return;
+  }
+  details.hidden = false;
+  $('#variants-count').textContent = String(sets.length);
+  sec.append(el('div', 'muted', 'Variant sets defined in the USD file. Switching re-composes the model from the file already downloaded; the camera stays put.'));
+  if (source.notes.length) {
+    const box = el('div', 'muted');
+    box.textContent = 'Rendering notes: ' + source.notes.join(' · ');
+    sec.append(box);
+  }
+  sets.forEach((v, i) => {
+    addSelect(sec, {
+      id: `var-${i}`,
+      label: v.name,
+      options: v.options.map((o) => ({ value: o, label: o })),
+      get: () => source.selections[v.name] || v.selected,
+      set: (val) => applyVariant(v.name, val),
+    });
   });
 }
 
@@ -996,15 +1198,16 @@ async function loadLocalFile(file) {
   }
   const token = ++loadToken;
   const name = `${file.name} (local file)`;
+  forgetSource();
   setLoading(true, `Reading ${file.name}…`);
   clearError();
   hideEmpty();
   try {
     const buffer = await file.arrayBuffer();
     if (token !== loadToken) return;
-    const group = await parseBuffer(buffer);
+    const parsed = await parseBuffer(buffer);
     if (token !== loadToken) {
-      disposeGroup(group);
+      disposeGroup(parsed.group);
       return;
     }
     activeModelName = null; // not one of the server models
@@ -1015,7 +1218,9 @@ async function loadLocalFile(file) {
     refreshAllControls();
     renderModelList();
     setUrlModel(null); // a local file has no shareable server URL
-    installGroup(group, name, { size: file.size, extension: extOf(file.name) });
+    const meta = { size: file.size, extension: extOf(file.name) };
+    rememberSource(buffer, name, meta, parsed.variants, parsed.materialNotes);
+    installGroup(parsed.group, name, meta);
   } catch (err) {
     onLoadFailed(err, file.name, token);
   }
@@ -1275,6 +1480,7 @@ function renderModelInfo(displayName, group, meta = {}) {
   row('Materials / textures', `${s.materials} / ${s.textures}`);
   if (s.lights) row('Embedded lights', String(s.lights));
   row('Animation clips', String(s.clips));
+  if (source.variants.length) row('Variant sets', source.variants.map((v) => v.name).join(', '));
   sec.append(el('div', 'muted', 'Metres; the loader applies the file’s metersPerUnit and up-axis. Dimensions are the unscaled model.'));
 }
 
@@ -2166,4 +2372,4 @@ showEmpty('Loading model list…', 'Hang on a moment.');
 thumbLoadAll().finally(() => fetchModels({ autoload: true })); // previews first so cards render with images
 
 // Expose a tiny hook for debugging / automated checks.
-window.__viewer = { scene, camera, renderer, settings, anim, gallery, thumbs, loadModel, loadLocalFile, generateAllPreviews, get models() { return models; } };
+window.__viewer = { scene, camera, renderer, settings, anim, gallery, thumbs, loadModel, loadLocalFile, generateAllPreviews, get models() { return models; }, get specs() { return _lastParsedData?.specsByPath || null; } };

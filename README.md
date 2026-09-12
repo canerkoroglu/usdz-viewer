@@ -39,6 +39,20 @@ The container runs as a non-root user, restarts unless stopped, and exposes a he
 | `GET /api/models` | Metadata for every supported file in `./data` (name, extension, size, url). Sorted, Unicode-safe, never cached. |
 | `GET /models/<name>?v=<mtime>` | Streams one model (range requests supported, 1 h cache; the `v` query changes when the file changes). Strict path-traversal protection — only files directly inside `./data` with an allowed extension are served. |
 
+## Deploying the prebuilt image (e.g. the Windows Docker host)
+
+CI publishes `ghcr.io/canerkoroglu/usdz-viewer:latest` (plus a short-SHA tag) on every push to
+`main`. On the host you can then skip building entirely:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The compose file keeps its `build:` block, so `docker compose up -d --build` still builds locally.
+GitHub creates the package as **private** on first publish: either make it public in the package's
+settings on GitHub, or `docker login ghcr.io` on the host with a token that has `read:packages`.
+
 ## Running behind Nginx Proxy Manager (HTTPS)
 
 WebXR only works in a **secure context**, so for the Quest you need HTTPS (or `localhost`, see below).
@@ -65,6 +79,7 @@ Open **http://localhost:8090** in the Quest Browser — `localhost` counts as a 
 |---|---|
 | Orbit / zoom / pan | Drag / scroll / right-drag (two-finger on touch) |
 | Fit camera to model | **F** key, double-click the viewer, or *Model transform → Fit camera* |
+| Switch material variants | *Variants* section in the sidebar (appears when the file defines variant sets) — re-composes in place, no re-download; MaterialX-driven variants are baked to textures |
 | Play / pause animation | **Space**, the transport bar at the bottom (scrub, clip, speed), or the ▶/⏸ button in AR |
 | Pick a model | **▤ Models** gallery — grid or list, sort by name / size / date / type, format filters, accent-insensitive search (`kucuk` finds *Küçük*), arrow keys move between cards |
 | Preview thumbnails | Captured automatically the first time a model is viewed and cached in the browser (IndexedDB, refreshed when the file changes). **Generate previews** runs a one-off pass over models that have none — nothing is preloaded otherwise |
@@ -98,14 +113,15 @@ docker-compose.yml      service, read-only data mount, healthcheck
 server.js               Express 5 — API + traversal-safe streaming (createApp() factory)
 test/server.test.js     HTTP + path-safety tests
 index.html              Vite entry (must stay at the project root)
-src/main.js             three.js viewer, settings UI, animation, WebXR AR
+src/main.js             three.js viewer, settings UI, animation, variants, WebXR AR
+src/mtlx.js             MaterialX graph baker (recolour variants, RealityKit approximations)
 src/style.css           dark, responsive UI (sidebar on desktop, bottom sheet on phones)
 vite.config.js          build config
 ```
 
 ## Known limitations
 
-- USD **material variants** load with the file's default variant (switching variants is not exposed yet).
+- **MaterialX materials**: the viewer bakes common node graphs (image, HSV, mix, math…) to textures — that is how recolour variants render. RealityKit-only nodes (camera background blur, environment radiance, unlit surfaces) are approximated and flagged under *Variants*.
 - WebXR **light estimation** is used when the browser exposes it; otherwise the *AR lighting* mode is a manual fallback.
 - Some USDC (binary crate) array types are skipped by three.js's parser with a console warning; such attributes are simply ignored.
 - The viewer never writes to your model files. All lighting, shadow, ground, transform and animation state is viewer-side only.

@@ -6,7 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: usdz-viewer:latest
+    image: ghcr.io/canerkoroglu/usdz-viewer:latest
     container_name: usdz-viewer
     restart: unless-stopped
     ports:
