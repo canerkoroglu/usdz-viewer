@@ -27,6 +27,9 @@ import {
   AnimationMixer,
   FileLoader,
   DefaultLoadingManager,
+  LoopRepeat,
+  LoopOnce,
+  LoopPingPong,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
@@ -1142,6 +1145,18 @@ async function loadModel(model) {
 // Re-compose the current model with a different variant selection.
 async function applyVariant(setName, option) {
   if (!source.buffer) return;
+  const set = source.variants.find((v) => v.name === setName);
+  // Animation-like variant sets switch the playing clip instantly (three has
+  // already loaded every clip, so re-composing would change nothing anyway).
+  if (set && ANIM_SET_RE.test(setName) && anim.clips.length > 1) {
+    const idx = resolveClipIndex(set, option);
+    if (idx >= 0) {
+      source.selections = { ...source.selections, [setName]: option };
+      playClip(idx);
+      ui[`var-${source.variants.indexOf(set)}`]?.refresh?.();
+      return;
+    }
+  }
   const token = ++loadToken;
   source.selections = { ...source.selections, [setName]: option };
   setLoading(true, `Switching ${setName} → ${option}…`);
@@ -1237,7 +1252,35 @@ function frameDelta(now) {
   _lastFrameTime = now;
   return clamp(dt, 0, 0.1);
 }
-const anim = { mixer: null, clips: [], action: null, index: 0, playing: false, speed: 1 };
+const PLAYBACK_KEY = 'usdz-viewer.playback.v1';
+const LOOP_MODES = { repeat: LoopRepeat, once: LoopOnce, pingpong: LoopPingPong };
+let _pb = {};
+try {
+  _pb = JSON.parse(localStorage.getItem(PLAYBACK_KEY) || '{}');
+} catch (e) {
+  /* ignore */
+}
+const anim = {
+  mixer: null,
+  clips: [],
+  action: null,
+  index: 0,
+  playing: false,
+  speed: Number(_pb.speed) > 0 ? Number(_pb.speed) : 1,
+  loop: LOOP_MODES[_pb.loop] ? _pb.loop : 'repeat',
+};
+function savePlayback() {
+  try {
+    localStorage.setItem(PLAYBACK_KEY, JSON.stringify({ speed: anim.speed, loop: anim.loop }));
+  } catch (e) {
+    /* ignore */
+  }
+}
+// A variant set whose name looks like an animation/clip selector is driven by
+// the AnimationMixer rather than a full re-parse (three loads every clip
+// regardless of the variant selection, so re-composing changes nothing).
+const ANIM_SET_RE = /anim|clip|action|take|motion/i;
+const animVariantSet = () => source.variants.find((v) => ANIM_SET_RE.test(v.name));
 let _scrubWasPlaying = false;
 let _lastTick = -1;
 const fmtTime = (t) => `${t.toFixed(1)} s`;
@@ -1255,8 +1298,22 @@ function setupAnimation(group) {
   });
   anim.mixer = new AnimationMixer(group);
   anim.mixer.timeScale = anim.speed;
+  anim.mixer.addEventListener('finished', () => {
+    // Fires only for the "once" loop mode (clamped at the last frame).
+    anim.playing = false;
+    updateTransportUI();
+    invalidate();
+  });
   anim.clips = clips;
+  // Capture any remembered animation-variant choice BEFORE playClip(0), which
+  // syncs the selection back to clip 0 and would otherwise clobber it.
+  const set = animVariantSet();
+  const remembered = set && anim.clips.length > 1 ? source.selections[set.name] : null;
   playClip(0);
+  if (remembered) {
+    const idx = resolveClipIndex(set, remembered);
+    if (idx > 0) playClip(idx);
+  }
 }
 
 function teardownAnimation() {
@@ -1276,14 +1333,21 @@ function playClip(i) {
   anim.index = clamp(i, 0, anim.clips.length - 1);
   anim.mixer.stopAllAction();
   anim.action = anim.mixer.clipAction(anim.clips[anim.index]);
+  anim.action.setLoop(LOOP_MODES[anim.loop], Infinity);
+  anim.action.clampWhenFinished = true; // "once" holds the last frame, not the bind pose
   anim.action.reset().play();
   anim.playing = true;
+  syncAnimVariantSelection();
   updateTransportUI();
   invalidate();
 }
 
 function setPlaying(on) {
   if (!anim.action) return;
+  // If "once" already ran to the end, pressing play restarts it.
+  if (on && anim.loop === 'once' && anim.action.time >= anim.clips[anim.index].duration - 1e-3) {
+    anim.action.reset().play();
+  }
   anim.playing = on;
   anim.action.paused = !on;
   updateTransportUI();
@@ -1301,6 +1365,48 @@ function seekTo(t) {
 function setSpeed(s) {
   anim.speed = s;
   if (anim.mixer) anim.mixer.timeScale = s;
+  savePlayback();
+}
+
+function setLoopMode(mode) {
+  anim.loop = LOOP_MODES[mode] ? mode : 'repeat';
+  if (anim.action) anim.action.setLoop(LOOP_MODES[anim.loop], Infinity);
+  savePlayback();
+  updateTransportUI();
+}
+
+// Map a variant option onto a loaded clip index (name match, then positional).
+function resolveClipIndex(set, option) {
+  if (!set || option == null || !anim.clips.length) return -1;
+  const o = foldText(option);
+  let idx = anim.clips.findIndex((c) => {
+    if (!c.name) return false;
+    const a = foldText(c.name);
+    return a === o || a.includes(o) || o.includes(a);
+  });
+  if (idx < 0 && set.options.length === anim.clips.length) idx = set.options.indexOf(option);
+  return idx;
+}
+
+// Reflect the current clip back onto the animation-variant dropdown, so using
+// the transport clip picker keeps the sidebar control in sync.
+function syncAnimVariantSelection() {
+  const set = animVariantSet();
+  if (!set || !anim.clips.length) return;
+  const clip = anim.clips[anim.index];
+  let opt = null;
+  if (clip && clip.name) {
+    const a = foldText(clip.name);
+    opt = set.options.find((o) => {
+      const b = foldText(o);
+      return a === b || a.includes(b) || b.includes(a);
+    }) || null;
+  }
+  if (!opt && set.options.length === anim.clips.length) opt = set.options[anim.index];
+  if (opt && source.selections[set.name] !== opt) {
+    source.selections[set.name] = opt;
+    ui[`var-${source.variants.indexOf(set)}`]?.refresh?.();
+  }
 }
 
 // Called every frame from render(); advances the mixer while playing.
@@ -1350,6 +1456,7 @@ function updateTransportUI() {
   scrub.max = anim.clips[anim.index].duration;
   scrub.step = Math.max(anim.clips[anim.index].duration / 500, 0.001);
   $('#anim-speed').value = String(anim.speed);
+  $('#anim-loop').value = anim.loop;
   updateTransportTime();
 }
 
@@ -1367,6 +1474,7 @@ function wireTransport() {
   });
   $('#anim-clip').addEventListener('change', (e) => playClip(parseInt(e.target.value, 10)));
   $('#anim-speed').addEventListener('change', (e) => setSpeed(parseFloat(e.target.value)));
+  $('#anim-loop').addEventListener('change', (e) => setLoopMode(e.target.value));
 }
 
 // ===========================================================================
