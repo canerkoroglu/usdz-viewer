@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "express": "^5.2.1",
-    "qrcode-generator": "^1.5.2",
     "three": "^0.186.0"
   },
   "devDependencies": {

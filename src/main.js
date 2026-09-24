@@ -39,7 +39,6 @@ import { USDComposer } from 'three/addons/loaders/usd/USDComposer.js';
 import { unzipSync } from 'three/addons/libs/fflate.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
-import qrcode from 'qrcode-generator';
 import { applyMaterialXFallbacks, clearMaterialXCache } from './mtlx.js';
 
 import './style.css';
@@ -1478,7 +1477,7 @@ function wireTransport() {
 }
 
 // ===========================================================================
-// Deep links & sharing (URL + QR code)
+// Deep links (the URL reflects the current model)
 // ===========================================================================
 function setUrlModel(name) {
   try {
@@ -1489,45 +1488,6 @@ function setUrlModel(name) {
   } catch (e) {
     /* ignore */
   }
-}
-
-function openShare() {
-  const url = location.href;
-  $('#share-url').value = url;
-  const box = $('#share-qr');
-  try {
-    const qr = qrcode(0, 'M'); // type 0 = auto-size, medium error correction
-    qr.addData(url);
-    qr.make();
-    box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
-  } catch (e) {
-    box.textContent = 'Link is too long for a QR code — copy it instead.';
-  }
-  $('#share-copy').textContent = 'Copy';
-  $('#share-modal').hidden = false;
-}
-function closeShare() {
-  $('#share-modal').hidden = true;
-}
-async function copyShareUrl() {
-  const input = $('#share-url');
-  const btn = $('#share-copy');
-  try {
-    await navigator.clipboard.writeText(input.value);
-  } catch (e) {
-    input.select();
-    document.execCommand('copy');
-  }
-  btn.textContent = 'Copied ✓';
-  setTimeout(() => (btn.textContent = 'Copy'), 1500);
-}
-
-function wireShareAndTransport() {
-  $('#share-btn').addEventListener('click', openShare);
-  $('#share-close').addEventListener('click', closeShare);
-  $('#share-modal').querySelector('.modal-backdrop').addEventListener('click', closeShare);
-  $('#share-copy').addEventListener('click', copyShareUrl);
-  wireTransport();
 }
 
 // ===========================================================================
@@ -2524,7 +2484,6 @@ function wireChrome() {
     if (e.key === 'Escape') {
       closeModels();
       closeSettingsDrawer();
-      closeShare();
       return;
     }
     if (isTypingTarget(e) || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -2536,7 +2495,7 @@ function wireChrome() {
     }
   });
 
-  wireShareAndTransport();
+  wireTransport();
   wireGallery();
   wireDragAndDrop();
 }

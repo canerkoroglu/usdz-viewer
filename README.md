@@ -10,7 +10,7 @@ no database, no accounts.
 - Quest: **Start AR** → passthrough → aim + **trigger** to place → **controller thumbstick to scale (↕) and rotate (↔), A/X to reset, B/Y to exit**.
   Placement is true real-world scale (USD units are applied). The controllers drive everything because Quest's dom-overlay button taps are unreliable.
 - Model gallery with preview thumbnails, sorting, format filters and search.
-- Share any model as a link or QR code (`/?model=chair.usdz`).
+- Deep-link to any model — the URL reflects the current model (`/?model=chair.usdz`).
 
 ## Quick start
 
@@ -59,7 +59,7 @@ WebXR only works in a **secure context**, so for the Quest you need HTTPS (or `l
 
 1. NPM → **Proxy Hosts → Add**: domain `3d.example.com`, scheme `http`, forward host = your Docker host IP, **forward port `8090`**. Enable *Block Common Exploits* and *Websockets Support*.
 2. **SSL** tab: request a Let's Encrypt certificate, enable *Force SSL* and *HTTP/2*.
-3. Open `https://3d.example.com` on the Quest — or press **Share** on the desktop and scan the QR code.
+3. Open `https://3d.example.com` on the Quest.
 
 The frontend uses only relative URLs, so nothing else needs configuring.
 
@@ -84,7 +84,6 @@ Open **http://localhost:8090** in the Quest Browser — `localhost` counts as a 
 | Pick a model | **▤ Models** gallery — grid or list, sort by name / size / date / type, format filters, accent-insensitive search (`kucuk` finds *Küçük*), arrow keys move between cards |
 | Preview thumbnails | Captured automatically the first time a model is viewed and cached in the browser (IndexedDB, refreshed when the file changes). **Generate previews** runs a one-off pass over models that have none — nothing is preloaded otherwise |
 | Open a specific model | `/?model=<filename>` — the URL updates as you switch models |
-| Share | **Share** button → link + QR code |
 | Preview a local file | Drag & drop a USD file onto the viewer (parsed in the browser, never uploaded) |
 | Close dialogs | **Esc** |
 
