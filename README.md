@@ -7,8 +7,8 @@ no database, no accounts.
 - Drop model files in `./data` — they are served **read-only**, never copied or modified.
 - Desktop: orbit / zoom / pan, animation playback, full viewer-side lighting, shadows,
   environment and transform controls, model statistics.
-- Quest: **Start AR** → passthrough → aim the reticle at a surface → trigger/pinch to place →
-  scale / rotate / play-pause / reset. Placement is true real-world scale (USD units are applied).
+- Quest: **Start AR** → passthrough → aim + **trigger** to place → **controller thumbstick to scale (↕) and rotate (↔), A/X to reset, B/Y to exit**.
+  Placement is true real-world scale (USD units are applied). The controllers drive everything because Quest's dom-overlay button taps are unreliable.
 - Model gallery with preview thumbnails, sorting, format filters and search.
 - Share any model as a link or QR code (`/?model=chair.usdz`).
 

@@ -2093,6 +2093,9 @@ const ar = {
   lightProbe: null,
   placePos: new Vector3(),
   placeQuat: new Quaternion(),
+  prevA: false,
+  prevB: false,
+  hudAt: 0,
 };
 const _yawQuat = new Quaternion();
 const _yAxis = new Vector3(0, 1, 0);
@@ -2169,7 +2172,7 @@ function onXRStart() {
 
   session.addEventListener('select', onARSelect);
   applyARLighting();
-  updateARStatus(currentInner ? 'Point at a surface, then select to place' : 'No model loaded — exit AR and pick a model first');
+  updateARStatus(currentInner ? 'Aim + trigger to place · then thumbstick ↕ scale · ↔ rotate' : 'No model loaded — exit AR and pick a model first');
 }
 
 function onXREnd() {
@@ -2194,7 +2197,7 @@ function onARSelect() {
   ar.placed = true;
   modelContainer.visible = true;
   applyARPlacement();
-  updateARStatus('Placed · select again to move · buttons scale / rotate');
+  updateARStatus('Placed · thumbstick ↕ scale · ↔ rotate · A/X reset · B/Y exit');
 }
 
 function applyARPlacement() {
@@ -2255,7 +2258,76 @@ function updateARStatus(text) {
   if (s) s.textContent = text;
 }
 
-function updateAR(frame) {
+// Deadzone + rates for controller-driven manipulation.
+const AR_DEADZONE = 0.15;
+const AR_SCALE_PER_SEC = 1.8; // full stick ≈ x6 per second
+const AR_ROT_PER_SEC = 2.2; // radians/sec at full stick
+
+// Transient HUD text, throttled so it doesn't thrash the dom-overlay.
+function arHud(text) {
+  const now = performance.now();
+  if (now - ar.hudAt > 120) {
+    ar.hudAt = now;
+    updateARStatus(text);
+  }
+}
+
+// Reliable manipulation on Quest: the WebXR controller Gamepad (thumbstick +
+// face buttons). This works even where the dom-overlay's own button taps do
+// not. Either hand's thumbstick scales (up/down) and rotates (left/right);
+// A/X resets; B/Y exits. Placement stays on the trigger (the "select" event).
+function pollARControllers(dt) {
+  const session = renderer.xr.getSession();
+  if (!session || !dt) return;
+  try {
+    let ax = 0;
+    let ay = 0;
+    let aPressed = false;
+    let bPressed = false;
+    for (const src of session.inputSources) {
+      const gp = src.gamepad;
+      if (!gp) continue;
+      const axes = gp.axes || [];
+      const x = axes.length >= 4 ? axes[2] : axes[0] || 0; // xr-standard thumbstick
+      const y = axes.length >= 4 ? axes[3] : axes[1] || 0;
+      if (Math.abs(x) > Math.abs(ax)) ax = x;
+      if (Math.abs(y) > Math.abs(ay)) ay = y;
+      const b = gp.buttons || [];
+      if (b[4] && b[4].pressed) aPressed = true; // A / X
+      if (b[5] && b[5].pressed) bPressed = true; // B / Y
+    }
+    if (Math.abs(ax) < AR_DEADZONE) ax = 0;
+    if (Math.abs(ay) < AR_DEADZONE) ay = 0;
+
+    // Face buttons: rising-edge so a held press fires once.
+    if (aPressed && !ar.prevA) handleARAction('reset');
+    if (bPressed && !ar.prevB) handleARAction('exit');
+    ar.prevA = aPressed;
+    ar.prevB = bPressed;
+
+    if (!ar.placed) {
+      if ((ax || ay) && currentInner) arHud('Aim at a surface and pull the trigger to place first');
+      return;
+    }
+    let changed = false;
+    if (ay) {
+      ar.scaleMul = clamp(ar.scaleMul * Math.exp(-ay * AR_SCALE_PER_SEC * dt), 0.02, 100);
+      changed = true;
+    }
+    if (ax) {
+      ar.yaw += ax * AR_ROT_PER_SEC * dt;
+      changed = true;
+    }
+    if (changed) {
+      applyARPlacement();
+      arHud(`Scale ${Math.round(settings.transform.scale * ar.scaleMul * 100)}%  ·  up/down size · left/right rotate · A/X reset · B/Y exit`);
+    }
+  } catch (e) {
+    /* never let a controller quirk break the render loop */
+  }
+}
+
+function updateAR(frame, dt) {
   const refSpace = renderer.xr.getReferenceSpace();
   if (ar.hitTestSource && refSpace) {
     const results = frame.getHitTestResults(ar.hitTestSource);
@@ -2279,6 +2351,7 @@ function updateAR(frame) {
       /* ignore */
     }
   }
+  pollARControllers(dt);
 }
 
 // ===========================================================================
@@ -2308,9 +2381,10 @@ function resizeToDisplay() {
 // a model swap, a resize. Idle frames cost nothing, which matters for battery
 // on Quest and phones. In an XR session every frame is drawn.
 function render(time, frame) {
-  tickAnimation(frameDelta(time));
+  const dt = frameDelta(time);
+  tickAnimation(dt);
   if (renderer.xr.isPresenting) {
-    if (frame) updateAR(frame);
+    if (frame) updateAR(frame, dt);
     renderer.render(scene, camera);
     return;
   }

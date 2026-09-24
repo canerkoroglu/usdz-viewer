@@ -200,7 +200,10 @@
     <!-- ===================== AR DOM OVERLAY (WebXR) ===================== -->
     <!-- Hidden until an AR session starts; three.js ARButton toggles inline display. -->
     <div id="ar-overlay" style="display: none">
-      <div id="ar-status" class="ar-status">Point at a surface…</div>
+      <div class="ar-hud">
+        <div id="ar-status" class="ar-status">Point at a surface…</div>
+        <div id="ar-help" class="ar-help">Thumbstick ↕ scale · ↔ rotate · Trigger place · A/X reset · B/Y exit</div>
+      </div>
       <div id="ar-controls" class="ar-controls">
         <button data-ar="scale-down" class="ar-btn" type="button">−</button>
         <button data-ar="scale-up" class="ar-btn" type="button">+</button>
