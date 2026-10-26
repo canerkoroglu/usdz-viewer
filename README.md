@@ -28,8 +28,20 @@ docker compose logs -f usdz-viewer
 docker compose down
 ```
 
-The container runs as a non-root user, restarts unless stopped, and exposes a healthcheck on
-`GET /api/health`.
+The container runs as a non-root user with a read-only root filesystem, no Linux capabilities
+and `no-new-privileges`, restarts unless stopped, and exposes a healthcheck on `GET /api/health`.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8090` | Listen port (validated, 1–65535) |
+| `HOST` | `0.0.0.0` | Listen address |
+| `DATA_DIR` | `/app/data` | Directory with the model files (read-only mount) |
+| `TRUST_PROXY` | *(off)* | Trust `X-Forwarded-*` from these proxies: a hop count (`1`), or addresses/subnets/presets (`loopback, 172.16.0.0/12`). Needed behind a reverse proxy so rate limiting sees real client IPs. Avoid `true`. |
+| `RATE_LIMIT_PER_MINUTE` | `600` | Requests per minute per client IP on `/api` and `/models` (`0` disables). The health probe is never limited. |
+
+Invalid values stop the server at startup with a clear message.
 
 ## HTTP API
 
@@ -37,7 +49,10 @@ The container runs as a non-root user, restarts unless stopped, and exposes a he
 |---|---|
 | `GET /api/health` | `{"status":"ok","service":"usdz-viewer"}` |
 | `GET /api/models` | Metadata for every supported file in `./data` (name, extension, size, url). Sorted, Unicode-safe, never cached. |
-| `GET /models/<name>?v=<mtime>` | Streams one model (range requests supported, 1 h cache; the `v` query changes when the file changes). Strict path-traversal protection — only files directly inside `./data` with an allowed extension are served. |
+| `GET /models/<name>?v=<mtime>` | Streams one model (range requests supported, 1 h cache; the `v` query changes when the file changes). Strict path-traversal protection — only files directly inside `./data` with an allowed extension are served; symlinks are followed only while they stay inside `./data`. |
+
+Errors are JSON (`{"error": "..."}`) on `/api` and `/models`; no paths or stack traces are ever
+returned. See [SECURITY.md](SECURITY.md) for the full security model.
 
 ## Deploying the prebuilt image (e.g. the Windows Docker host)
 
@@ -95,27 +110,44 @@ shows dimensions (m / cm), mesh, triangle, material, texture and animation count
 
 ```bash
 npm ci
-npm run dev                          # Vite dev server (frontend)
-DATA_DIR=./data node server.js       # API on http://localhost:8090
-npm test                             # server tests (Node's built-in runner, no extra deps)
+DATA_DIR=./data npm start            # API + built app on http://localhost:8090
+npm run dev                          # Vite dev server on http://localhost:5173 (proxies /api, /models to :8090)
+VITE_HOST=0.0.0.0 npm run dev        # ...deliberately exposed on the LAN
+npm test                             # server + frontend unit tests (Node's built-in runner)
+npm run lint                         # ESLint
+npm run format                       # Prettier (format:check in CI)
+npm run check                        # lint + format check + tests
 npm run build                        # production bundle -> dist/
 ```
 
-CI (`.github/workflows/ci.yml`) runs the build, the test-suite and a Docker image build on every
-push and pull request.
+Requires Node.js 24 or newer (the Docker image and CI use Node 26).
+
+CI (`.github/workflows/ci.yml`) runs on Node 24 and 26: `npm audit`, lint, the format check, the
+test-suite and the build, then builds the Docker image (with SBOM and provenance; pushed and
+attested on `main`). Pull requests also get a dependency review, CodeQL scans weekly and on every
+change, and Dependabot keeps npm packages, GitHub Actions (SHA-pinned) and the base image current.
 
 ## Project layout
 
 ```
-Dockerfile              multi-stage build (node:24-alpine), non-root runtime
-docker-compose.yml      service, read-only data mount, healthcheck
-server.js               Express 5 — API + traversal-safe streaming (createApp() factory)
-test/server.test.js     HTTP + path-safety tests
+Dockerfile              multi-stage build (pinned node:26-alpine), non-root, no npm at runtime
+docker-compose.yml      service, read-only data + root fs, dropped capabilities, healthcheck
+server.js               Express 5 — API, traversal-safe streaming, CSP/headers, rate limits
+SECURITY.md             threat model, controls and how to report issues
+test/server.test.js     HTTP, path-safety, headers, symlink and rate-limit tests
+test/utils.test.js      unit tests for the pure frontend helpers
+test/usd.test.js        unit tests for USD parsing / variants / binding strength
 index.html              Vite entry (must stay at the project root)
-src/main.js             three.js viewer, settings UI, animation, variants, WebXR AR
+src/main.js             three.js scene, settings UI, animation, gallery, WebXR AR (app wiring)
+src/config.js           defaults, presets, option tables, storage keys
+src/usd.js              USD/USDA/USDC/USDZ parsing, variant enumeration, material-binding strength
 src/mtlx.js             MaterialX graph baker (recolour variants, RealityKit approximations)
+src/utils.js            pure helpers (formatting, matching, deep merge)
+src/storage.js          safe localStorage JSON helpers
+src/thumbstore.js       IndexedDB persistence for gallery previews
+src/dom.js              tiny DOM helpers
 src/style.css           dark, responsive UI (sidebar on desktop, bottom sheet on phones)
-vite.config.js          build config
+vite.config.js          build + dev-server config (dev proxy to the backend)
 ```
 
 ## Known limitations

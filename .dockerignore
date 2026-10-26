@@ -14,3 +14,8 @@ README.md
 scratchpad
 test
 .github
+.env
+.env.*
+*.pem
+*.key
+coverage

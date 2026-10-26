@@ -12,13 +12,23 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server.js",
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "lint": "eslint .",
+    "format": "prettier --write \"**/*.js\"",
+    "format:check": "prettier --check \"**/*.js\"",
+    "check": "npm run lint && npm run format:check && npm test"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "three": "^0.186.0"
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0"
   },
   "devDependencies": {
-    "vite": "^8.2.2"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "three": "^0.186.1",
+    "vite": "^8.3.5"
   }
 }

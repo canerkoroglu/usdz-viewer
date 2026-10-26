@@ -1,0 +1,8 @@
+# Normalise line endings: LF in the repo and the working tree on every OS.
+* text=auto eol=lf
+
+# Binary model / image assets
+*.usdz binary
+*.usdc binary
+*.png binary
+*.jpg binary

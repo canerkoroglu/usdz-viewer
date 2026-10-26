@@ -588,9 +588,10 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 4px; }
 }
 
 /* --------------------------- AR DOM overlay --------------------------- */
-/* Hidden initially via inline style="display:none" in index.html; the three.js
-   ARButton toggles this element's inline display ('' on start -> flex here,
-   'none' on end). Do NOT set display:none in this rule or AR would stay hidden. */
+/* Hidden initially via the [hidden] attribute; setupARButton() replaces it
+   with inline display:none, which the three.js ARButton toggles ('' on start ->
+   flex here, 'none' on end). Do NOT set display:none in this rule or AR would
+   stay hidden. No inline style attribute in the HTML: the CSP forbids it. */
 #ar-overlay {
   position: fixed;
   inset: 0;

@@ -12,9 +12,9 @@
 // that as "leave the material as the composer built it".
 
 import { CanvasTexture, SRGBColorSpace, NoColorSpace, RepeatWrapping } from 'three';
+import { MATERIAL_BINDING_REL as REL, stripVariantSegments } from './usd.js';
 
 const MAX_BAKE = 2048; // per-side cap: keeps CPU/GPU cost sane on headsets
-const REL = '.material:binding';
 
 // PreviewSurface input -> three.js material slot
 const SLOTS = {
@@ -31,7 +31,6 @@ export function clearMaterialXCache() {
   cache.clear();
 }
 
-const stripVariantSegments = (p) => p.replace(/\/\{[^}]*\}/g, '');
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const toVec = (v) => (Array.isArray(v) ? v.map(Number) : typeof v === 'number' ? [v] : v && typeof v === 'object' && 'x' in v ? [v.x, v.y, v.z ?? 0] : [0]);
 
@@ -80,8 +79,14 @@ function materialPathFor(mesh, bindings) {
 
 // Surface shader kinds we understand and how their inputs map to slots.
 const SURFACE_KINDS = [
-  { match: (id) => id.includes('PreviewSurface'), inputs: { diffuseColor: 'diffuseColor', emissiveColor: 'emissiveColor', normal: 'normal', roughness: 'roughness', metallic: 'metallic', occlusion: 'occlusion' } },
-  { match: (id) => id.includes('realitykit_pbr_surfaceshader'), inputs: { baseColor: 'diffuseColor', emissiveColor: 'emissiveColor', normal: 'normal', roughness: 'roughness', metallic: 'metallic', ambientOcclusion: 'occlusion' } },
+  {
+    match: (id) => id.includes('PreviewSurface'),
+    inputs: { diffuseColor: 'diffuseColor', emissiveColor: 'emissiveColor', normal: 'normal', roughness: 'roughness', metallic: 'metallic', occlusion: 'occlusion' },
+  },
+  {
+    match: (id) => id.includes('realitykit_pbr_surfaceshader'),
+    inputs: { baseColor: 'diffuseColor', emissiveColor: 'emissiveColor', normal: 'normal', roughness: 'roughness', metallic: 'metallic', ambientOcclusion: 'occlusion' },
+  },
   { match: (id) => id.includes('realitykit_unlit_surfaceshader'), inputs: { color: 'diffuseColor' }, unlit: true },
 ];
 
@@ -136,12 +141,18 @@ function hsv2rgb([h, s, v]) {
   const q = v * (1 - f * s);
   const t = v * (1 - (1 - f) * s);
   switch (i % 6) {
-    case 0: return [v, t, p];
-    case 1: return [q, v, p];
-    case 2: return [p, v, t];
-    case 3: return [p, q, v];
-    case 4: return [t, p, v];
-    default: return [v, p, q];
+    case 0:
+      return [v, t, p];
+    case 1:
+      return [q, v, p];
+    case 2:
+      return [p, v, t];
+    case 3:
+      return [p, q, v];
+    case 4:
+      return [t, p, v];
+    default:
+      return [v, p, q];
   }
 }
 function broadcast(fn, a, b) {
@@ -198,7 +209,8 @@ function makeCompiler(specs, ctx) {
     else if (/^(min|max)_/.test(base)) expr = binary(base.startsWith('min') ? Math.min : Math.max, 0, 0);
     else if (/^power_/.test(base)) expr = binary((a, b) => Math.pow(Math.max(a, 0), b), 1, 1);
     else if (/^mix_/.test(base)) expr = tag({ k: 'op', fn: (bg, fg, m) => mixVec(bg, fg, m[0]), args: [input('bg', 0), input('fg', 0), input('mix', 0)] });
-    else if (/^clamp_/.test(base)) expr = tag({ k: 'op', fn: (a, lo, hi) => broadcast((x, l) => Math.max(x, l), broadcast(Math.min, a, hi), lo), args: [input('in', 0), input('low', 0), input('high', 1)] });
+    else if (/^clamp_/.test(base))
+      expr = tag({ k: 'op', fn: (a, lo, hi) => broadcast((x, l) => Math.max(x, l), broadcast(Math.min, a, hi), lo), args: [input('in', 0), input('low', 0), input('high', 1)] });
     else if (/^invert_/.test(base)) expr = tag({ k: 'op', fn: (a, amt) => broadcast((x, m) => m - x, a, amt), args: [input('in', 0), input('amount', 1)] });
     else if (/^(dot_|convert_|swizzle_|normalmap)/.test(base)) expr = input('in', [0, 0, 0]);
     else if (/^constant_/.test(base)) expr = input('value', 0);
@@ -208,9 +220,7 @@ function makeCompiler(specs, ctx) {
     // background on Apple devices. Approximate with neutral values and say so.
     else if (base === 'realitykit_environment_radiance') {
       ctx.note('environment radiance approximated as base colour × ambient');
-      expr = outName === 'specularRadiance'
-        ? tag({ k: 'c', v: [0.03, 0.03, 0.03] })
-        : tag({ k: 'op', fn: (c) => c.map((x) => x * 0.55), args: [input('baseColor', [1, 1, 1])] });
+      expr = outName === 'specularRadiance' ? tag({ k: 'c', v: [0.03, 0.03, 0.03] }) : tag({ k: 'op', fn: (c) => c.map((x) => x * 0.55), args: [input('baseColor', [1, 1, 1])] });
     } else if (base === 'realitykit_background_blur_color3') {
       ctx.note('camera-background blur approximated as neutral grey');
       expr = tag({ k: 'c', v: [0.45, 0.45, 0.45] });

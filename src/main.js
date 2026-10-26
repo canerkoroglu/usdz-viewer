@@ -18,195 +18,72 @@ import {
   Mesh,
   PMREMGenerator,
   SRGBColorSpace,
-  NoToneMapping,
-  NeutralToneMapping,
-  ACESFilmicToneMapping,
-  AgXToneMapping,
   PCFShadowMap,
   ColorManagement,
   AnimationMixer,
   FileLoader,
-  DefaultLoadingManager,
-  LoopRepeat,
-  LoopOnce,
-  LoopPingPong,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
-import { USDAParser } from 'three/addons/loaders/usd/USDAParser.js';
-import { USDCParser } from 'three/addons/loaders/usd/USDCParser.js';
-import { USDComposer } from 'three/addons/loaders/usd/USDComposer.js';
-import { unzipSync } from 'three/addons/libs/fflate.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+
+import {
+  STORAGE_KEYS,
+  MAX_LOCAL_FILE_BYTES,
+  MODEL_EXTENSIONS,
+  TONE_MAPPING,
+  SHADOW_QUALITY,
+  PERF_QUALITY,
+  AR_LIGHTING,
+  LOOP_MODES,
+  DEFAULT_TRANSFORM,
+  DEFAULT_SETTINGS,
+  LIGHTING_PRESETS,
+  ANIM_SET_RE,
+} from './config.js';
+import {
+  clamp,
+  deg2rad,
+  stepDecimals,
+  deepMerge,
+  mergeKnown,
+  isValidModelEntry,
+  foldText,
+  namesMatch,
+  extOf,
+  formatSize,
+  formatTime,
+  formatPct,
+  relTime,
+  describeLoadError,
+  materialsOf,
+  texturesOf,
+} from './utils.js';
+import { $, el, isTypingTarget } from './dom.js';
+import { loadJSON, saveJSON } from './storage.js';
+import { loadAllThumbs, putThumb } from './thumbstore.js';
+import { composeUSD } from './usd.js';
 import { applyMaterialXFallbacks, clearMaterialXCache } from './mtlx.js';
 
 import './style.css';
 
-// ===========================================================================
-// Constants & defaults
-// ===========================================================================
-const STORAGE_KEY = 'usdz-viewer.settings.v1';
-const SECTIONS_KEY = 'usdz-viewer.sections.v1';
-const MODEL_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
 // Deep link: /?model=<filename> opens that model directly (see fetchModels).
 const linkedModel = new URLSearchParams(location.search).get('model');
 
 // Gallery view state (grid/list, sort, format filter) — persisted separately
 // from the render settings so "Reset all" leaves it alone.
-const GALLERY_KEY = 'usdz-viewer.gallery.v1';
-const gallery = { view: 'grid', sort: 'name', dir: 'asc', format: 'all' };
-try {
-  Object.assign(gallery, JSON.parse(localStorage.getItem(GALLERY_KEY) || '{}'));
-} catch (e) {
-  /* ignore */
-}
-function saveGallery() {
-  try {
-    localStorage.setItem(GALLERY_KEY, JSON.stringify(gallery));
-  } catch (e) {
-    /* ignore */
-  }
-}
-
-const TONE_MAPPING = {
-  none: { label: 'None', value: NoToneMapping },
-  neutral: { label: 'Neutral', value: NeutralToneMapping },
-  aces: { label: 'ACES Filmic', value: ACESFilmicToneMapping },
-  agx: { label: 'AgX', value: AgXToneMapping },
-};
-
-const SHADOW_QUALITY = {
-  low: { label: 'Low', size: 512 },
-  medium: { label: 'Medium', size: 1024 },
-  high: { label: 'High', size: 2048 },
-};
-
-// Performance preset controls render resolution (device-pixel-ratio cap).
-const PERF_QUALITY = {
-  low: { label: 'Low', pixelRatio: 1.0 },
-  medium: { label: 'Medium', pixelRatio: 1.5 },
-  high: { label: 'High', pixelRatio: 2.0 },
-};
-
-// AR lighting modes scale the viewer lights while in passthrough AR.
-const AR_LIGHTING = {
-  auto: { label: 'Auto', ambient: 1.0, key: 1.0 },
-  soft: { label: 'Soft', ambient: 1.4, key: 0.6 },
-  neutral: { label: 'Neutral', ambient: 1.0, key: 1.0 },
-  strong: { label: 'Strong', ambient: 0.7, key: 1.6 },
-};
-
-// Quest-friendly defaults: one shadow-casting key light, fill/point off,
-// medium shadow map. `preset` is informational ('default' | 'custom' | name).
-const DEFAULT_SETTINGS = {
-  preset: 'default',
-  env: { background: '#12151c', exposure: 1.0, toneMapping: 'neutral', envIntensity: 1.0 },
-  ambient: { enabled: true, intensity: 0.6, sky: '#bfd3ff', ground: '#20242c' },
-  key: { enabled: true, intensity: 2.4, x: 3, y: 5, z: 2, color: '#ffffff' },
-  fill: { enabled: false, intensity: 0.7, x: -4, y: 2, z: 3, color: '#ffffff' },
-  point: { enabled: false, intensity: 8, x: 0, y: 3, z: 0, distance: 0, decay: 2, color: '#ffffff' },
-  shadow: { enabled: true, quality: 'medium', bias: -0.0005, normalBias: 0.02 },
-  ground: { enabled: true, opacity: 0.5, size: 8, color: '#000000', receive: true },
-  transform: { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, scale: 1 },
-  performance: { quality: 'medium' },
-  ar: { lighting: 'auto' },
-};
-
-const DEFAULT_TRANSFORM = { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, scale: 1 };
-
-// Lighting presets patch the relevant subsections and are applied instantly.
-const LIGHTING_PRESETS = {
-  studio: {
-    ambient: { enabled: true, intensity: 0.5 },
-    key: { enabled: true, intensity: 2.4, x: 3, y: 5, z: 2 },
-    fill: { enabled: true, intensity: 0.7, x: -4, y: 2, z: 3 },
-    point: { enabled: false },
-    shadow: { enabled: true, quality: 'medium' },
-    env: { background: '#14181f', envIntensity: 1.0 },
-  },
-  outdoor: {
-    ambient: { enabled: true, intensity: 0.95 },
-    key: { enabled: true, intensity: 3.0, x: 5, y: 8, z: 3 },
-    fill: { enabled: false },
-    point: { enabled: false },
-    shadow: { enabled: true, quality: 'high' },
-    env: { background: '#233447', envIntensity: 1.2 },
-  },
-  soft: {
-    ambient: { enabled: true, intensity: 1.25 },
-    key: { enabled: true, intensity: 1.2, x: 2, y: 4, z: 3 },
-    fill: { enabled: true, intensity: 0.5 },
-    point: { enabled: false },
-    shadow: { enabled: true, quality: 'medium' },
-    env: { background: '#1b1e26', envIntensity: 1.1 },
-  },
-  flat: {
-    ambient: { enabled: true, intensity: 1.8 },
-    key: { enabled: false },
-    fill: { enabled: false },
-    point: { enabled: false },
-    shadow: { enabled: false },
-    env: { background: '#151821', envIntensity: 0.8 },
-  },
-};
-
-// ===========================================================================
-// Tiny utilities
-// ===========================================================================
-const $ = (sel) => document.querySelector(sel);
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text != null) n.textContent = text;
-  return n;
-};
-const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
-const deg2rad = (d) => (d * Math.PI) / 180;
-
-// Decimal places to display for a slider step (robust to 1e-6 style steps).
-function stepDecimals(step) {
-  if (!(step > 0)) return 0;
-  return clamp(Math.ceil(-Math.log10(step) - 1e-9), 0, 6);
-}
-
-function isObject(x) {
-  return x && typeof x === 'object' && !Array.isArray(x);
-}
-function deepMerge(target, patch) {
-  for (const k of Object.keys(patch)) {
-    if (isObject(patch[k]) && isObject(target[k])) deepMerge(target[k], patch[k]);
-    else target[k] = patch[k];
-  }
-  return target;
-}
-
-// Accent/case-insensitive text for search ("kucuk" matches "Küçük").
-const foldText = (s) => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-
-const extOf = (name) => String(name).split('.').pop().toLowerCase();
-const isTypingTarget = (e) => !!e.target?.closest?.('input, select, textarea, [contenteditable]');
+// Saved values are untrusted input: only known keys of the same type are taken.
+const gallery = mergeKnown({ view: 'grid', sort: 'name', dir: 'asc', format: 'all' }, loadJSON(STORAGE_KEYS.gallery));
+const saveGallery = () => saveJSON(STORAGE_KEYS.gallery, gallery);
 
 // ===========================================================================
 // Settings state + persistence
 // ===========================================================================
 // NOTE: `settings` (and its sub-objects) must only ever be mutated in place —
 // the control closures hold references to the sub-objects.
-let settings = structuredClone(DEFAULT_SETTINGS);
-try {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (raw) settings = deepMerge(structuredClone(DEFAULT_SETTINGS), JSON.parse(raw));
-} catch (e) {
-  console.warn('Could not read saved settings:', e);
-}
-
-function saveSettings() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  } catch (e) {
-    /* storage may be unavailable (private mode) — non-fatal */
-  }
-}
+const settings = mergeKnown(structuredClone(DEFAULT_SETTINGS), loadJSON(STORAGE_KEYS.settings));
+const saveSettings = () => saveJSON(STORAGE_KEYS.settings, settings);
 
 // ===========================================================================
 // Renderer / scene / camera / controls
@@ -295,10 +172,7 @@ groundMesh.receiveShadow = true;
 scene.add(groundMesh);
 
 // ---- AR reticle ------------------------------------------------------------
-const reticle = new Mesh(
-  new RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
-  new MeshBasicMaterial({ color: 0x4c8dff })
-);
+const reticle = new Mesh(new RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2), new MeshBasicMaterial({ color: 0x4c8dff }));
 reticle.matrixAutoUpdate = false;
 reticle.visible = false;
 scene.add(reticle);
@@ -375,10 +249,7 @@ function applyShadows() {
   if (_shadowsWereEnabled !== enabled) {
     _shadowsWereEnabled = enabled;
     scene.traverse((o) => {
-      if (o.material) {
-        const mats = Array.isArray(o.material) ? o.material : [o.material];
-        mats.forEach((m) => (m.needsUpdate = true));
-      }
+      for (const m of materialsOf(o)) m.needsUpdate = true;
     });
   }
   renderer.shadowMap.needsUpdate = true;
@@ -698,7 +569,14 @@ function buildSettingsUI() {
   // ---- Ground ----
   const ground = $('#sec-ground');
   addToggle(ground, { id: 'gr-en', label: 'Ground enabled', ...bind(settings.ground, 'enabled', applyGround) });
-  addToggle(ground, { id: 'gr-recv', label: 'Receive shadows', ...bind(settings.ground, 'receive', () => { applyGround(); applyShadows(); }) });
+  addToggle(ground, {
+    id: 'gr-recv',
+    label: 'Receive shadows',
+    ...bind(settings.ground, 'receive', () => {
+      applyGround();
+      applyShadows();
+    }),
+  });
   addSlider(ground, { id: 'gr-op', label: 'Opacity', min: 0, max: 1, step: 0.02, ...bind(settings.ground, 'opacity', applyGround) });
   addSlider(ground, { id: 'gr-size', label: 'Size (× model)', min: 1, max: 40, step: 0.5, ...bind(settings.ground, 'size', applyGround) });
   addColor(ground, { id: 'gr-col', label: 'Shadow color', ...bind(settings.ground, 'color', applyGround) });
@@ -740,7 +618,9 @@ function buildSettingsUI() {
     id: 'ar-light',
     label: 'AR lighting',
     options: Object.entries(AR_LIGHTING).map(([k, v]) => ({ value: k, label: v.label })),
-    ...bind(settings.ar, 'lighting', () => { if (ar.active) applyARLighting(); }),
+    ...bind(settings.ar, 'lighting', () => {
+      if (ar.active) applyARLighting();
+    }),
   });
   arSec.appendChild(el('div', 'muted', 'AR lighting adjusts the viewer lights for passthrough. "Auto" uses WebXR light estimation when the device exposes it, otherwise a neutral fallback.'));
 
@@ -749,23 +629,14 @@ function buildSettingsUI() {
 
 // Remember which settings sections are expanded.
 function persistSections() {
-  let state = {};
-  try {
-    state = JSON.parse(localStorage.getItem(SECTIONS_KEY) || '{}');
-  } catch (e) {
-    /* ignore */
-  }
+  const state = loadJSON(STORAGE_KEYS.sections);
   document.querySelectorAll('#settings-panel details.section').forEach((d) => {
     const key = d.querySelector('.section-body')?.id;
     if (!key) return;
     if (key in state) d.open = !!state[key];
     d.addEventListener('toggle', () => {
       state[key] = d.open;
-      try {
-        localStorage.setItem(SECTIONS_KEY, JSON.stringify(state));
-      } catch (e) {
-        /* ignore */
-      }
+      saveJSON(STORAGE_KEYS.sections, state);
     });
   });
 }
@@ -783,10 +654,17 @@ function applyLightingPreset(key) {
   saveSettings();
 }
 
-function resetTransform() {
-  Object.assign(settings.transform, DEFAULT_TRANSFORM); // mutate in place — controls hold a ref to this object
+// Reset the per-model transform (sidebar + AR adjustments). Mutates
+// settings.transform in place — the controls hold a reference to it.
+function resetModelTransform({ unplaceAR = false } = {}) {
+  Object.assign(settings.transform, DEFAULT_TRANSFORM);
   ar.yaw = 0;
   ar.scaleMul = 1;
+  if (unplaceAR) ar.placed = false;
+}
+
+function resetTransform() {
+  resetModelTransform();
   applyTransform();
   refreshAllControls();
   saveSettings();
@@ -838,17 +716,14 @@ function normalizeModel(group) {
 }
 
 function disposeMaterial(material) {
-  for (const key in material) {
-    const val = material[key];
-    if (val && val.isTexture) val.dispose();
-  }
+  for (const t of texturesOf(material)) t.dispose();
   material.dispose();
 }
 
 function disposeGroup(group) {
   group.traverse((o) => {
-    if (o.geometry) o.geometry.dispose();
-    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(disposeMaterial);
+    o.geometry?.dispose();
+    materialsOf(o).forEach(disposeMaterial);
   });
 }
 
@@ -911,16 +786,13 @@ function installGroup(group, displayName, meta = {}) {
     if (!o.isMesh) return;
     o.castShadow = true;
     o.receiveShadow = true;
-    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
-      if (!m) continue;
-      for (const k in m) {
-        const t = m[k];
-        if (t && t.isTexture && !seenTex.has(t)) {
-          seenTex.add(t);
-          if (t.anisotropy < aniso) {
-            t.anisotropy = aniso;
-            t.needsUpdate = true;
-          }
+    for (const m of materialsOf(o)) {
+      for (const t of texturesOf(m)) {
+        if (seenTex.has(t)) continue;
+        seenTex.add(t);
+        if (t.anisotropy < aniso) {
+          t.anisotropy = aniso;
+          t.needsUpdate = true;
         }
       }
     }
@@ -940,16 +812,6 @@ function installGroup(group, displayName, meta = {}) {
   invalidate();
 }
 
-// Turn loader errors into something a user can act on.
-function describeLoadError(err, name) {
-  const msg = String(err?.message || err || 'unknown error');
-  if (/\b404\b|not found/i.test(msg)) return `"${name}" was not found on the server — it may have been removed. Refresh the model list.`;
-  if (/\b(5\d\d)\b/.test(msg)) return `The server failed while sending "${name}" (${msg}).`;
-  if (/failed to fetch|network|load failed|aborted/i.test(msg)) return `Network error while downloading "${name}". Check the connection and try again.`;
-  if (/zip|usdz|crate|parse|unexpected|invalid|malformed|token/i.test(msg)) return `"${name}" could not be parsed — it may be corrupted or use USD features this viewer does not support. (${msg})`;
-  return `Failed to load "${name}". (${msg})`;
-}
-
 function onLoadFailed(err, name, token) {
   if (token !== loadToken) return;
   console.error('Model load failed:', err);
@@ -961,121 +823,16 @@ function onLoadFailed(err, name, token) {
   if (!currentInner) showEmpty('Nothing loaded', 'Pick another model, or drop a USD file here.');
 }
 
-const formatPct = (e) => (e && e.lengthComputable && e.total > 0 ? ` ${Math.round((e.loaded / e.total) * 100)}%` : '');
-
 // ---- USD parsing ------------------------------------------------------------
-// Mirrors USDLoader.parse() using the same parsers/composer, but exposes the
-// composer's variant-selection argument and enumerates the file's variant sets.
+// The format-level work (layers, variants, binding strength) lives in usd.js.
 const fileLoader = new FileLoader().setResponseType('arraybuffer');
-const CRATE_MAGIC = [0x50, 0x58, 0x52, 0x2d, 0x55, 0x53, 0x44, 0x43]; // "PXR-USDC"
-const isCrate = (u8) => u8.byteLength >= 8 && CRATE_MAGIC.every((b, i) => u8[i] === b);
-const lowerExt = (name) => {
-  const d = name.lastIndexOf('.');
-  const s = name.lastIndexOf('/');
-  return d < 0 || s > d ? '' : name.slice(d + 1).toLowerCase();
-};
-const asArrayBuffer = (u8) =>
-  u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength ? u8.buffer : u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
-
-// Variant sets: a prim lists its sets in fields.variantSetChildren, the options
-// live on "<prim>/{set=}" (fields.variantChildren) and the file's own choice in
-// fields.variantSelection. Selections are global per set name (as the composer
-// applies them), so identically named sets on several prims switch together.
-function enumerateVariants(parsed) {
-  const specs = parsed?.specsByPath || {};
-  const sets = new Map();
-  for (const path in specs) {
-    const f = specs[path]?.fields;
-    if (!f?.variantSetChildren) continue;
-    for (const setName of f.variantSetChildren) {
-      const entry = sets.get(setName) || { name: setName, options: new Set(), selected: null };
-      for (const o of specs[`${path}/{${setName}=}`]?.fields?.variantChildren || []) entry.options.add(o);
-      if (!entry.selected && f.variantSelection?.[setName]) entry.selected = f.variantSelection[setName];
-      sets.set(setName, entry);
-    }
-  }
-  return [...sets.values()]
-    .map((s) => ({ name: s.name, options: [...s.options], selected: s.selected || [...s.options][0] || null }))
-    .filter((s) => s.options.length > 1);
-}
-
-// USD material-binding strength: a binding authored on an ancestor prim with
-// bindMaterialAs = "strongerThanDescendants" overrides the bindings of every
-// mesh below it. three's composer resolves each mesh's own binding only, so
-// variants that switch materials this way (a common exporter pattern) would
-// fall back to placeholder materials. Propagate such bindings down to the Mesh
-// descendants in the spec table before composing.
-const stripVariantSegments = (p) => p.replace(/\/\{[^}]*\}/g, '');
-function propagateStrongBindings(specs) {
-  if (!specs) return;
-  const REL = '.material:binding';
-  const strong = [];
-  for (const k in specs) {
-    if (!k.endsWith(REL)) continue;
-    const fields = specs[k]?.fields;
-    if (fields?.bindMaterialAs === 'strongerThanDescendants' && fields.targetPaths?.length) {
-      strong.push({ prim: k.slice(0, -REL.length), spec: specs[k] });
-    }
-  }
-  if (!strong.length) return;
-  strong.sort((a, b) => b.prim.length - a.prim.length); // deepest ancestor wins
-  const isPrimKey = (k) => !k.slice(k.lastIndexOf('/')).includes('.');
-  const isMesh = (k) => specs[k]?.fields?.typeName === 'Mesh' || specs[stripVariantSegments(k)]?.fields?.typeName === 'Mesh';
-  for (const k in specs) {
-    if (!isPrimKey(k)) continue;
-    const anc = strong.find((a) => k.startsWith(a.prim + '/'));
-    if (!anc || !isMesh(k)) continue;
-    specs[k + REL] = { ...anc.spec, fields: { ...anc.spec.fields, bindMaterialAs: 'weakerThanDescendants' } };
-    const props = specs[k].fields?.properties;
-    if (Array.isArray(props) && !props.includes('material:binding')) specs[k].fields.properties = [...props, 'material:binding'];
-  }
-}
-
-// Synchronous compose; textures resolve through the returned promise.
-function composeUSD(buffer, variantSelections = {}) {
-  const usda = new USDAParser();
-  const usdc = new USDCParser();
-  const decoder = new TextDecoder();
-  const bytes = new Uint8Array(buffer);
-  let data;
-  const assets = {};
-  let basePath = '';
-  if (isCrate(bytes)) {
-    data = usdc.parseData(buffer);
-  } else if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-    const zip = unzipSync(bytes);
-    const names = Object.keys(zip);
-    if (!names.length) throw new Error('Empty USDZ archive');
-    for (const name of names) {
-      const ext = lowerExt(name);
-      const fb = zip[name];
-      if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'avif') {
-        assets[name] = fb; // raw image bytes; the composer creates object URLs lazily
-        continue;
-      }
-      if (ext !== 'usd' && ext !== 'usda' && ext !== 'usdc') continue;
-      assets[name] = isCrate(fb) ? usdc.parseData(asArrayBuffer(fb)) : usda.parseData(decoder.decode(fb));
-    }
-    const first = names[0]; // per the USDZ spec the first entry is the root layer
-    const slash = first.lastIndexOf('/');
-    basePath = slash >= 0 ? first.slice(0, slash) : '';
-    data = assets[first];
-    if (!data) throw new Error(`Invalid USDZ package: the first entry ("${first}") must be a USD layer.`);
-  } else {
-    data = usda.parseData(decoder.decode(bytes));
-  }
-  propagateStrongBindings(data?.specsByPath);
-  _lastParsedData = data;
-  const composer = new USDComposer(DefaultLoadingManager);
-  const group = composer.compose(data, assets, variantSelections, basePath);
-  return { group, variants: enumerateVariants(data), ready: Promise.all(composer.texturePromises || []), data, assets, basePath };
-}
 
 // Parse off the current task (so the "Loading…" text paints first) and wait
 // for the textures.
 async function parseBuffer(buffer, variantSelections = {}) {
   await new Promise((r) => setTimeout(r, 20));
   const result = composeUSD(buffer, variantSelections);
+  _lastParsedData = result.data;
   await result.ready;
   // Materials driven by MaterialX node graphs (procedural recolours etc.) are
   // beyond the composer; bake them to textures so variants render correctly.
@@ -1210,6 +967,10 @@ async function loadLocalFile(file) {
     showError(`"${file.name}" is not a USD file (.usd, .usda, .usdc or .usdz).`);
     return;
   }
+  if (file.size > MAX_LOCAL_FILE_BYTES) {
+    showError(`"${file.name}" is too large to preview in the browser (${formatSize(file.size)}; limit ${formatSize(MAX_LOCAL_FILE_BYTES)}).`);
+    return;
+  }
   const token = ++loadToken;
   const name = `${file.name} (local file)`;
   forgetSource();
@@ -1225,10 +986,7 @@ async function loadLocalFile(file) {
       return;
     }
     activeModelName = null; // not one of the server models
-    Object.assign(settings.transform, DEFAULT_TRANSFORM);
-    ar.yaw = 0;
-    ar.scaleMul = 1;
-    ar.placed = false;
+    resetModelTransform({ unplaceAR: true });
     refreshAllControls();
     renderModelList();
     setUrlModel(null); // a local file has no shareable server URL
@@ -1251,38 +1009,21 @@ function frameDelta(now) {
   _lastFrameTime = now;
   return clamp(dt, 0, 0.1);
 }
-const PLAYBACK_KEY = 'usdz-viewer.playback.v1';
-const LOOP_MODES = { repeat: LoopRepeat, once: LoopOnce, pingpong: LoopPingPong };
-let _pb = {};
-try {
-  _pb = JSON.parse(localStorage.getItem(PLAYBACK_KEY) || '{}');
-} catch (e) {
-  /* ignore */
-}
+const savedPlayback = loadJSON(STORAGE_KEYS.playback);
 const anim = {
   mixer: null,
   clips: [],
   action: null,
   index: 0,
   playing: false,
-  speed: Number(_pb.speed) > 0 ? Number(_pb.speed) : 1,
-  loop: LOOP_MODES[_pb.loop] ? _pb.loop : 'repeat',
+  speed: Number(savedPlayback.speed) > 0 ? Number(savedPlayback.speed) : 1,
+  loop: LOOP_MODES[savedPlayback.loop] ? savedPlayback.loop : 'repeat',
 };
-function savePlayback() {
-  try {
-    localStorage.setItem(PLAYBACK_KEY, JSON.stringify({ speed: anim.speed, loop: anim.loop }));
-  } catch (e) {
-    /* ignore */
-  }
-}
-// A variant set whose name looks like an animation/clip selector is driven by
-// the AnimationMixer rather than a full re-parse (three loads every clip
-// regardless of the variant selection, so re-composing changes nothing).
-const ANIM_SET_RE = /anim|clip|action|take|motion/i;
+const savePlayback = () => saveJSON(STORAGE_KEYS.playback, { speed: anim.speed, loop: anim.loop });
+// Animation-like variant sets (see ANIM_SET_RE) drive the mixer, not a re-parse.
 const animVariantSet = () => source.variants.find((v) => ANIM_SET_RE.test(v.name));
 let _scrubWasPlaying = false;
 let _lastTick = -1;
-const fmtTime = (t) => `${t.toFixed(1)} s`;
 
 function setupAnimation(group) {
   const clips = (Array.isArray(group.animations) ? group.animations : []).filter((c) => c && c.duration > 0);
@@ -1377,12 +1118,7 @@ function setLoopMode(mode) {
 // Map a variant option onto a loaded clip index (name match, then positional).
 function resolveClipIndex(set, option) {
   if (!set || option == null || !anim.clips.length) return -1;
-  const o = foldText(option);
-  let idx = anim.clips.findIndex((c) => {
-    if (!c.name) return false;
-    const a = foldText(c.name);
-    return a === o || a.includes(o) || o.includes(a);
-  });
+  let idx = anim.clips.findIndex((c) => namesMatch(c.name, option));
   if (idx < 0 && set.options.length === anim.clips.length) idx = set.options.indexOf(option);
   return idx;
 }
@@ -1393,14 +1129,7 @@ function syncAnimVariantSelection() {
   const set = animVariantSet();
   if (!set || !anim.clips.length) return;
   const clip = anim.clips[anim.index];
-  let opt = null;
-  if (clip && clip.name) {
-    const a = foldText(clip.name);
-    opt = set.options.find((o) => {
-      const b = foldText(o);
-      return a === b || a.includes(b) || b.includes(a);
-    }) || null;
-  }
+  let opt = set.options.find((o) => namesMatch(clip?.name, o)) || null;
   if (!opt && set.options.length === anim.clips.length) opt = set.options[anim.index];
   if (opt && source.selections[set.name] !== opt) {
     source.selections[set.name] = opt;
@@ -1426,7 +1155,7 @@ function updateTransportTime() {
   const t = clamp(anim.action.time, 0, d);
   const scrub = $('#anim-scrub');
   if (document.activeElement !== scrub) scrub.value = t; // don't fight the user's drag
-  $('#anim-time').textContent = `${fmtTime(t)} / ${fmtTime(d)}`;
+  $('#anim-time').textContent = `${formatTime(t)} / ${formatTime(d)}`;
 }
 
 function updateTransportUI() {
@@ -1446,7 +1175,7 @@ function updateTransportUI() {
   anim.clips.forEach((c, i) => {
     const o = document.createElement('option');
     o.value = String(i);
-    o.textContent = `${c.name || `Clip ${i + 1}`} (${fmtTime(c.duration)})`;
+    o.textContent = `${c.name || `Clip ${i + 1}`} (${formatTime(c.duration)})`;
     sel.append(o);
   });
   sel.value = String(anim.index);
@@ -1485,7 +1214,7 @@ function setUrlModel(name) {
     if (name) url.searchParams.set('model', name);
     else url.searchParams.delete('model');
     history.replaceState(null, '', url);
-  } catch (e) {
+  } catch {
     /* ignore */
   }
 }
@@ -1513,10 +1242,9 @@ function computeModelStats(group) {
       verts += n;
       tris += g.index ? g.index.count / 3 : n / 3;
     }
-    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
-      if (!m) continue;
+    for (const m of materialsOf(o)) {
       mats.add(m);
-      for (const k in m) if (m[k] && m[k].isTexture) texs.add(m[k]);
+      for (const t of texturesOf(m)) texs.add(t);
     }
   });
   return { meshes, skinned, tris: Math.round(tris), verts, materials: mats.size, textures: texs.size, lights, clips: (group.animations || []).filter((c) => c && c.duration > 0).length };
@@ -1610,7 +1338,8 @@ async function fetchModels({ autoload = false } = {}) {
     const res = await fetch('/api/models', { headers: { Accept: 'application/json' }, cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    models = Array.isArray(data.models) ? data.models : [];
+    // Defensive: only well-formed, same-origin model entries are accepted.
+    models = Array.isArray(data.models) ? data.models.filter(isValidModelEntry) : [];
     renderModelList();
     $('#model-count').textContent = `${models.length} model${models.length === 1 ? '' : 's'}`;
     $('#data-note').textContent = data.warning ? `⚠ ${data.warning}` : '';
@@ -1620,10 +1349,7 @@ async function fetchModels({ autoload = false } = {}) {
       // Honour a ?model= deep link (exact name first, then accent/case-insensitive).
       let wanted = null;
       if (linkedModel) {
-        wanted =
-          models.find((m) => m.name === linkedModel) ||
-          models.find((m) => foldText(m.name) === foldText(linkedModel)) ||
-          null;
+        wanted = models.find((m) => m.name === linkedModel) || models.find((m) => foldText(m.name) === foldText(linkedModel)) || null;
       }
       selectModel(wanted || models[0]);
       if (linkedModel && !wanted) {
@@ -1649,58 +1375,18 @@ const thumbs = new Map(); // name -> { v, dataUrl, at }
 const thumbWaiters = new Map(); // name -> resolve() (used by "Generate previews")
 let thumbPending = null; // { name, version, framesLeft }
 
-let _thumbDbPromise = null;
-function thumbDb() {
-  if (_thumbDbPromise) return _thumbDbPromise;
-  _thumbDbPromise = new Promise((resolve) => {
-    try {
-      const req = indexedDB.open('usdz-viewer', 1);
-      req.onupgradeneeded = () => req.result.createObjectStore('thumbs');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-      req.onblocked = () => resolve(null);
-    } catch (e) {
-      resolve(null); // e.g. storage disabled — previews just won't persist
-    }
-  });
-  return _thumbDbPromise;
-}
-
-async function thumbLoadAll() {
-  const db = await thumbDb();
-  if (!db) return;
-  await new Promise((resolve) => {
-    try {
-      const req = db.transaction('thumbs', 'readonly').objectStore('thumbs').openCursor();
-      req.onsuccess = () => {
-        const c = req.result;
-        if (c) {
-          thumbs.set(c.key, c.value);
-          c.continue();
-        } else resolve();
-      };
-      req.onerror = () => resolve();
-    } catch (e) {
-      resolve();
-    }
-  });
+// Wake a "Generate previews" run waiting on this model (capture done or failed).
+function resolveThumbWaiter(name) {
+  const waiter = thumbWaiters.get(name);
+  if (!waiter) return;
+  thumbWaiters.delete(name);
+  waiter();
 }
 
 async function thumbSave(name, entry) {
   thumbs.set(name, entry);
-  const db = await thumbDb();
-  if (db) {
-    try {
-      db.transaction('thumbs', 'readwrite').objectStore('thumbs').put(entry, name);
-    } catch (e) {
-      /* quota / private mode — keep the in-memory copy */
-    }
-  }
-  const waiter = thumbWaiters.get(name);
-  if (waiter) {
-    thumbWaiters.delete(name);
-    waiter();
-  }
+  await putThumb(name, entry);
+  resolveThumbWaiter(name);
 }
 
 const hasFreshThumb = (m) => {
@@ -1747,11 +1433,7 @@ function afterFrameDrawn() {
     });
   } catch (e) {
     console.warn('Preview capture failed:', e);
-    const waiter = thumbWaiters.get(name);
-    if (waiter) {
-      thumbWaiters.delete(name);
-      waiter();
-    }
+    resolveThumbWaiter(name);
   }
 }
 
@@ -1822,19 +1504,6 @@ async function generateAllPreviews() {
 }
 
 // ---- Gallery rendering -----------------------------------------------------
-function relTime(iso) {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (!Number.isFinite(ms)) return '';
-  const min = Math.round(ms / 60000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min} min ago`;
-  const h = Math.round(min / 60);
-  if (h < 48) return `${h} h ago`;
-  const d = Math.round(h / 24);
-  if (d < 60) return `${d} d ago`;
-  return new Date(iso).toLocaleDateString();
-}
-
 const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
 const SORTERS = {
   name: byName,
@@ -1847,9 +1516,7 @@ function visibleModels() {
   const q = foldText($('#model-search')?.value || '').trim();
   const dir = gallery.dir === 'desc' ? -1 : 1;
   const sorter = SORTERS[gallery.sort] || byName;
-  return models
-    .filter((m) => (gallery.format === 'all' || m.extension === gallery.format) && (!q || foldText(m.name).includes(q)))
-    .sort((a, b) => sorter(a, b) * dir);
+  return models.filter((m) => (gallery.format === 'all' || m.extension === gallery.format) && (!q || foldText(m.name).includes(q))).sort((a, b) => sorter(a, b) * dir);
 }
 
 function syncGalleryToolbar() {
@@ -1992,20 +1659,11 @@ function wireGallery() {
   });
 }
 
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
 function selectModel(model) {
   activeModelName = model.name;
   setUrlModel(model.name);
   // Reset model-specific transform; keep global lighting/environment settings.
-  Object.assign(settings.transform, DEFAULT_TRANSFORM); // mutate in place — controls hold a ref to this object
-  ar.yaw = 0;
-  ar.scaleMul = 1;
-  ar.placed = false;
+  resetModelTransform({ unplaceAR: true });
   refreshAllControls();
   renderModelList();
   closeModels();
@@ -2069,6 +1727,9 @@ function setupARButton() {
     optionalFeatures: ['dom-overlay', 'light-estimation', 'local-floor'],
     domOverlay: { root: arOverlay },
   };
+  // Hand visibility over to ARButton, which toggles the inline display.
+  arOverlay.style.display = 'none';
+  arOverlay.hidden = false;
   const btn = ARButton.createButton(renderer, sessionInit);
   holder.appendChild(btn);
 
@@ -2099,34 +1760,36 @@ function onXRStart() {
   try {
     renderer.xr.setFoveation?.(1.0);
     renderer.xr.setFramebufferScaleFactor?.(1.0);
-  } catch (e) {
+  } catch {
     /* ignore — non-XR renderer */
   }
   scene.background = null; // passthrough
   groundMesh.visible = false;
   modelContainer.visible = false; // hidden until placed
 
-  session.requestReferenceSpace('viewer').then((viewerSpace) => {
-    if (session.requestHitTestSource) {
-      session
-        .requestHitTestSource({ space: viewerSpace })
-        .then((src) => {
-          ar.hitTestSource = src;
-        })
-        .catch((e) => {
-          console.warn('hit-test unavailable:', e);
-          updateARStatus('Surface detection (hit-test) is unavailable on this device');
-        });
-    }
-  });
+  session
+    .requestReferenceSpace('viewer')
+    .then((viewerSpace) => session.requestHitTestSource?.({ space: viewerSpace }))
+    .then((src) => {
+      if (src) ar.hitTestSource = src;
+    })
+    .catch((e) => {
+      console.warn('hit-test unavailable:', e);
+      updateARStatus('Surface detection (hit-test) is unavailable on this device');
+    });
 
   // Optional light estimation — never required.
   try {
     const enabled = session.enabledFeatures;
     if (session.requestLightProbe && (!enabled || enabled.includes('light-estimation'))) {
-      session.requestLightProbe().then((p) => { ar.lightProbe = p; }).catch(() => {});
+      session
+        .requestLightProbe()
+        .then((p) => {
+          ar.lightProbe = p;
+        })
+        .catch(() => {});
     }
-  } catch (e) {
+  } catch {
     /* ignore */
   }
 
@@ -2282,7 +1945,7 @@ function pollARControllers(dt) {
       applyARPlacement();
       arHud(`Scale ${Math.round(settings.transform.scale * ar.scaleMul * 100)}%  ·  up/down size · left/right rotate · A/X reset · B/Y exit`);
     }
-  } catch (e) {
+  } catch {
     /* never let a controller quirk break the render loop */
   }
 }
@@ -2307,7 +1970,7 @@ function updateAR(frame, dt) {
     try {
       const est = frame.getLightEstimate(ar.lightProbe);
       if (est) applyLightEstimate(est);
-    } catch (e) {
+    } catch {
       /* ignore */
     }
   }
@@ -2510,7 +2173,26 @@ wireChrome();
 setupARButton();
 applyAll();
 showEmpty('Loading model list…', 'Hang on a moment.');
-thumbLoadAll().finally(() => fetchModels({ autoload: true })); // previews first so cards render with images
+loadAllThumbs(thumbs).finally(() => fetchModels({ autoload: true })); // previews first so cards render with images
 
-// Expose a tiny hook for debugging / automated checks.
-window.__viewer = { scene, camera, renderer, settings, anim, gallery, thumbs, loadModel, loadLocalFile, generateAllPreviews, get models() { return models; }, get specs() { return _lastParsedData?.specsByPath || null; } };
+// Debug hook for development and automated checks only (dev server or ?debug).
+if (import.meta.env?.DEV || new URLSearchParams(location.search).has('debug')) {
+  window.__viewer = {
+    scene,
+    camera,
+    renderer,
+    settings,
+    anim,
+    gallery,
+    thumbs,
+    loadModel,
+    loadLocalFile,
+    generateAllPreviews,
+    get models() {
+      return models;
+    },
+    get specs() {
+      return _lastParsedData?.specsByPath || null;
+    },
+  };
+}

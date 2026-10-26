@@ -1,6 +1,7 @@
 # Docker Compose for usdz-viewer
 # The ./data directory on the host is bind-mounted read-only; model files are
-# NOT baked into the image.
+# NOT baked into the image. The container runs as a non-root user with a
+# read-only root filesystem and no Linux capabilities.
 services:
   usdz-viewer:
     build:
@@ -9,6 +10,7 @@ services:
     image: ghcr.io/canerkoroglu/usdz-viewer:latest
     container_name: usdz-viewer
     restart: unless-stopped
+    init: true
     ports:
       - "8090:8090"
     volumes:
@@ -17,6 +19,26 @@ services:
       - PORT=8090
       - NODE_ENV=production
       - DATA_DIR=/app/data
+      # Behind a reverse proxy (e.g. Nginx Proxy Manager), trust it so client
+      # IPs are correct for rate limiting. Use its address/subnet, not "true".
+      # - TRUST_PROXY=172.16.0.0/12
+      # Requests per minute per client on /api and /models (0 = off).
+      # - RATE_LIMIT_PER_MINUTE=600
+    # ---- Hardening ----
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       # Node's built-in fetch — no curl/wget needed inside the image.
       test:

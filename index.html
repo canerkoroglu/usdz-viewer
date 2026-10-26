@@ -2,10 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#0f1115" />
     <title>USD / USDZ Viewer</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234c8dff' d='M12 2 3 7v10l9 5 9-5V7z'/%3E%3C/svg%3E" />
@@ -176,8 +173,10 @@
     </div>
 
     <!-- ===================== AR DOM OVERLAY (WebXR) ===================== -->
-    <!-- Hidden until an AR session starts; three.js ARButton toggles inline display. -->
-    <div id="ar-overlay" style="display: none">
+    <!-- Hidden until an AR session starts. setupARButton() swaps the [hidden]
+         attribute for an inline display:none (set via the CSSOM, which the CSP
+         allows) that three.js ARButton then toggles. -->
+    <div id="ar-overlay" hidden>
       <div class="ar-hud">
         <div id="ar-status" class="ar-status">Point at a surface…</div>
         <div id="ar-help" class="ar-help">Thumbstick ↕ scale · ↔ rotate · Trigger place · A/X reset · B/Y exit</div>
