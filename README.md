@@ -118,6 +118,7 @@ npm run lint                         # ESLint
 npm run format                       # Prettier (format:check in CI)
 npm run check                        # lint + format check + tests
 npm run build                        # production bundle -> dist/
+npm run build:watch                  # rebuild dist/ on every change (pair with docker-compose.dev.yml)
 ```
 
 Requires Node.js 24 or newer (the Docker image and CI use Node 26).
@@ -132,6 +133,7 @@ change, and Dependabot keeps npm packages, GitHub Actions (SHA-pinned) and the b
 ```
 Dockerfile              multi-stage build (pinned node:26-alpine), non-root, no npm at runtime
 docker-compose.yml      service, read-only data + root fs, dropped capabilities, healthcheck
+docker-compose.dev.yml  opt-in dev overlay: mounts dist/ + server.js, `node --watch`
 server.js               Express 5 — API, traversal-safe streaming, CSP/headers, rate limits
 SECURITY.md             threat model, controls and how to report issues
 test/server.test.js     HTTP, path-safety, headers, symlink and rate-limit tests

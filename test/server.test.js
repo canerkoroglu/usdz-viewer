@@ -140,6 +140,13 @@ describe('HTTP API', () => {
     assert.equal(await res.text(), 'PK');
   });
 
+  it('labels failed model sends as JSON, not as the model file', async () => {
+    const res = await fetch(`${base}/models/Zebra.usdz`, { headers: { Range: 'bytes=999-' } });
+    assert.equal(res.status, 416);
+    assert.match(res.headers.get('content-type'), /^application\/json/);
+    assert.deepEqual(await res.json(), { error: 'Failed to send model' });
+  });
+
   it('blocks path traversal and sub-directory access with 400', async () => {
     for (const p of ['..%2Fserver.js', '%2e%2e%2F%2e%2e%2Fetc%2Fpasswd.usdz', 'sub%2Finner.usdz', '%2Fetc%2Fpasswd.usdz']) {
       const res = await fetch(`${base}/models/${p}`);
@@ -283,11 +290,20 @@ describe('security headers and hardening', () => {
     assert.ok(!(await page.text()).includes('script'));
   });
 
-  it('rejects malformed percent-encoding without leaking internals', async () => {
+  it('rejects malformed percent-encoding with a JSON error that leaks no internals', async () => {
     const res = await fetch(`${base}/models/%E0%A4%A`);
     assert.equal(res.status, 400);
+    assert.match(res.headers.get('content-type'), /^application\/json/);
     const text = await res.text();
     assert.ok(!/at |node_modules|URIError/.test(text), 'no stack trace in the response');
+  });
+
+  it('answers unmatched /models paths with a JSON 404', async () => {
+    for (const p of ['/models', '/models/', '/models/a/b.usdz']) {
+      const res = await fetch(`${base}${p}`);
+      assert.equal(res.status, 404, p);
+      assert.deepEqual(await res.json(), { error: 'Not found' }, p);
+    }
   });
 
   it('rejects over-long names and Windows-style separators', async () => {

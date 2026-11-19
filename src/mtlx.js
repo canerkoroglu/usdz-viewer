@@ -21,21 +21,19 @@ const SLOTS = {
   diffuseColor: { prop: 'map', srgb: true, channels: 3 },
   emissiveColor: { prop: 'emissiveMap', srgb: true, channels: 3 },
   normal: { prop: 'normalMap', srgb: false, channels: 3, imageOnly: true },
-  roughness: { prop: 'roughnessMap', srgb: false, channels: 1, scalar: 'roughness' },
-  metallic: { prop: 'metalnessMap', srgb: false, channels: 1, scalar: 'metalness' },
-  occlusion: { prop: 'aoMap', srgb: false, channels: 1 },
+  // `sampled`: the channel three reads from this map.
+  roughness: { prop: 'roughnessMap', srgb: false, channels: 1, scalar: 'roughness', sampled: 1 },
+  metallic: { prop: 'metalnessMap', srgb: false, channels: 1, scalar: 'metalness', sampled: 2 },
+  occlusion: { prop: 'aoMap', srgb: false, channels: 1, sampled: 0 },
 };
-
-const cache = new Map(); // bake key -> HTMLCanvasElement
-export function clearMaterialXCache() {
-  cache.clear();
-}
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const toVec = (v) => (Array.isArray(v) ? v.map(Number) : typeof v === 'number' ? [v] : v && typeof v === 'object' && 'x' in v ? [v.x, v.y, v.z ?? 0] : [0]);
 
 function variantSegmentsMatch(path, selections) {
-  for (const m of path.matchAll(/\/\{([^=}]+)=([^}]*)\}/g)) if (selections[m[1]] !== m[2]) return false;
+  // Sets with a single option are not enumerated (nothing to choose) but are
+  // still composed, so only a known, different selection rules a binding out.
+  for (const m of path.matchAll(/\/\{([^=}]+)=([^}]*)\}/g)) if (m[1] in selections && selections[m[1]] !== m[2]) return false;
   return true;
 }
 
@@ -358,8 +356,10 @@ function anyTexture(material) {
 /**
  * Bake MaterialX-driven surface inputs for every mesh in `group` whose bound
  * material the composer left untextured. Returns the number of maps applied.
+ * `cache` (bake key -> canvas) must belong to one source file: keys only
+ * identify the variant selection and material path, not the file.
  */
-export async function applyMaterialXFallbacks(group, specs, assets, selections, basePath = '', onStatus) {
+export async function applyMaterialXFallbacks(group, specs, assets, selections, basePath = '', onStatus, cache = new Map()) {
   const result = { applied: 0, notes: [] };
   if (!specs || !group) return result;
   const bindings = resolveBindings(specs, selections);
@@ -437,9 +437,9 @@ export async function applyMaterialXFallbacks(group, specs, assets, selections, 
                 height: 0,
               };
               const expr = makeCompiler(specs, ctx)(node, out);
-              if (expr.k === 'img') {
-                // Plain image (possibly one channel): no per-pixel evaluation needed —
-                // three samples the right channel of the map itself.
+              if (expr.k === 'img' && (expr.chan === null || expr.chan === slot.sampled)) {
+                // Plain image whose channel three samples itself: copy it as-is,
+                // no per-pixel evaluation needed.
                 const bytes = findAsset(assets, files[expr.img], basePath);
                 if (!bytes) throw new Error(`missing texture ${files[expr.img]}`);
                 const { w, h } = await bitmapSize(bytes);
@@ -450,14 +450,7 @@ export async function applyMaterialXFallbacks(group, specs, assets, selections, 
                 canvas.width = W;
                 canvas.height = H;
                 canvas.getContext('2d').putImageData(new ImageData(await decodeToPixels(bytes, W, H), W, H), 0, 0);
-                cache.set(key, canvas);
-                material[slot.prop] = makeTexture(canvas, slot.srgb, anyTexture(material));
-                if (slot.scalar) material[slot.scalar] = 1;
-                material.needsUpdate = true;
-                applied++;
-                continue;
-              }
-              if (files.length === 0) {
+              } else if (files.length === 0) {
                 // Pure constant graph: evaluate once and set the scalar/colour.
                 const v = makeEvaluator(ctx)(expr, 0);
                 if (slot.scalar) material[slot.scalar] = clamp01(v[0]);
@@ -465,18 +458,19 @@ export async function applyMaterialXFallbacks(group, specs, assets, selections, 
                 material.needsUpdate = true;
                 applied++;
                 continue;
+              } else {
+                onStatus?.('Decoding MaterialX textures…');
+                const byteList = files.map((f) => findAsset(assets, f, basePath));
+                if (byteList.some((b) => !b)) throw new Error(`missing texture(s) ${files.filter((f, i) => !byteList[i]).join(', ')}`);
+                const sizes = await Promise.all(byteList.map(bitmapSize));
+                const maxW = Math.max(...sizes.map((s) => s.w));
+                const maxH = Math.max(...sizes.map((s) => s.h));
+                const s = Math.min(1, MAX_BAKE / Math.max(maxW, maxH));
+                ctx.width = Math.max(1, Math.round(maxW * s));
+                ctx.height = Math.max(1, Math.round(maxH * s));
+                ctx.pixels = await Promise.all(byteList.map((b) => decodeToPixels(b, ctx.width, ctx.height)));
+                canvas = await bakeExpr(expr, ctx, slot.channels, onStatus);
               }
-              onStatus?.('Decoding MaterialX textures…');
-              const byteList = files.map((f) => findAsset(assets, f, basePath));
-              if (byteList.some((b) => !b)) throw new Error(`missing texture(s) ${files.filter((f, i) => !byteList[i]).join(', ')}`);
-              const sizes = await Promise.all(byteList.map(bitmapSize));
-              const maxW = Math.max(...sizes.map((s) => s.w));
-              const maxH = Math.max(...sizes.map((s) => s.h));
-              const s = Math.min(1, MAX_BAKE / Math.max(maxW, maxH));
-              ctx.width = Math.max(1, Math.round(maxW * s));
-              ctx.height = Math.max(1, Math.round(maxH * s));
-              ctx.pixels = await Promise.all(byteList.map((b) => decodeToPixels(b, ctx.width, ctx.height)));
-              canvas = await bakeExpr(expr, ctx, slot.channels, onStatus);
             }
             cache.set(key, canvas);
           }

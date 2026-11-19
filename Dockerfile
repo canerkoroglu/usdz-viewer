@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# Pinned base image (Node 26 on Alpine). Dependabot keeps this current.
-ARG NODE_IMAGE=node:26.12.1-alpine3.24
+# Pinned base image (Node 26 on Alpine), written out in each FROM so Dependabot
+# can see and update it (it does not resolve ARG substitutions).
 
 # ---------------------------------------------------------------------------
 # Stage 1 — build the Vite frontend bundle
 # ---------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS build
+FROM node:26.12.1-alpine3.24 AS build
 WORKDIR /app
 
 # Install ALL dependencies (incl. devDeps: vite, three) reproducibly from the
@@ -22,7 +22,7 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Stage 2 — production dependencies only (express, helmet, rate limiter)
 # ---------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS deps
+FROM node:26.12.1-alpine3.24 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
@@ -30,7 +30,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 # ---------------------------------------------------------------------------
 # Stage 3 — minimal runtime image
 # ---------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS runtime
+FROM node:26.12.1-alpine3.24 AS runtime
 
 LABEL org.opencontainers.image.title="usdz-viewer" \
       org.opencontainers.image.description="Lightweight web viewer for USD/USDA/USDC/USDZ with WebXR AR" \

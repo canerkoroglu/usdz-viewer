@@ -26,7 +26,7 @@ import { rateLimit } from 'express-rate-limit';
 import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -313,7 +313,8 @@ export function createApp({ dataDir, distDir, trustProxy = false, rateLimitPerMi
         // only genuine server failures deserve an error log and a 500.
         const status = sendErr.status || sendErr.statusCode || 500;
         if (status >= 500) console.error('[models] send failed:', sendErr);
-        res.removeHeader('Cache-Control');
+        // Drop the model's headers so the JSON error isn't labelled as the file.
+        for (const h of ['Cache-Control', 'Content-Type', 'ETag', 'Last-Modified']) res.removeHeader(h);
         sendJsonError(res, status, status === 404 ? 'Model not found' : 'Failed to send model');
       } else if (sendErr && sendErr.code !== 'ECONNABORTED') {
         // Connection dropped mid-stream; nothing more we can do.
@@ -321,6 +322,9 @@ export function createApp({ dataDir, distDir, trustProxy = false, rateLimitPerMi
       }
     });
   });
+
+  // Anything else under /models (nested paths, bare /models) gets a JSON 404 too.
+  app.use('/models', (_req, res) => sendJsonError(res, 404, 'Not found'));
 
   // Static frontend (built by Vite). Served after the API routes so it never
   // shadows them. index.html is returned for "/".
@@ -344,14 +348,13 @@ export function createApp({ dataDir, distDir, trustProxy = false, rateLimitPerMi
 
   // Last-resort error handler: never leak stack traces or internal messages.
   // (Express identifies error handlers by their four-argument signature.)
-  app.use((err, _req, res, _next) => {
+  app.use((err, req, res, _next) => {
     const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
     if (status >= 500) console.error('[server] unhandled error:', err);
     if (res.headersSent) return res.end();
-    res
-      .status(status)
-      .type('text/plain')
-      .send(status >= 500 ? 'Internal server error' : 'Bad request');
+    const message = status >= 500 ? 'Internal server error' : 'Bad request';
+    if (/^\/(api|models)(\/|$)/.test(req.path)) return sendJsonError(res, status, message);
+    res.status(status).type('text/plain').send(message);
   });
 
   return app;
@@ -393,7 +396,8 @@ export function start(config = loadConfig()) {
   return server;
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Compare real paths: Node resolves the main module through symlinks, argv[1] does not.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
 if (isMain) {
   try {
     start();

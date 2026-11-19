@@ -1,0 +1,19 @@
+# Opt-in DEV overlay — live code without rebuilding the image.
+#
+#   Terminal 1:  npm run build:watch          # rebuild dist/ on every src change
+#   Terminal 2:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+#   Frontend edit -> vite rewrites dist/ -> just refresh the browser.
+#   server.js edit -> `node --watch` restarts the process automatically.
+#
+# NOT auto-applied: plain `docker compose up -d` still runs the baked image, so
+# production and the Windows host are unaffected.
+services:
+  usdz-viewer:
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./data:/app/data:ro
+      - ./dist:/app/dist:ro
+      - ./server.js:/app/server.js:ro
+    command: ["node", "--watch", "server.js"]

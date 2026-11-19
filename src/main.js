@@ -64,7 +64,7 @@ import { $, el, isTypingTarget } from './dom.js';
 import { loadJSON, saveJSON } from './storage.js';
 import { loadAllThumbs, putThumb } from './thumbstore.js';
 import { composeUSD } from './usd.js';
-import { applyMaterialXFallbacks, clearMaterialXCache } from './mtlx.js';
+import { applyMaterialXFallbacks } from './mtlx.js';
 
 import './style.css';
 
@@ -701,18 +701,24 @@ let embeddedLights = [];
 let loadedModelName = null; // what is actually displayed (may differ from the list selection after a failed load)
 
 function normalizeModel(group) {
+  // Measure the model on its own: a parent's transform (the model container)
+  // must neither offset the centring nor scale the recorded size.
+  const parent = group.parent;
+  parent?.remove(group);
   group.position.set(0, 0, 0);
   group.updateMatrixWorld(true);
   _box.setFromObject(group);
-  if (_box.isEmpty()) return;
-  const center = _box.getCenter(new Vector3());
-  const size = _box.getSize(new Vector3());
-  group.position.x = -center.x;
-  group.position.z = -center.z;
-  group.position.y = -_box.min.y;
-  modelSize.copy(size);
-  modelHalfHeight = Math.max(size.y / 2, 0.01);
-  modelRadius = Math.max(0.5 * Math.hypot(size.x, size.y, size.z), 0.25);
+  if (!_box.isEmpty()) {
+    const center = _box.getCenter(new Vector3());
+    const size = _box.getSize(new Vector3());
+    group.position.x = -center.x;
+    group.position.z = -center.z;
+    group.position.y = -_box.min.y;
+    modelSize.copy(size);
+    modelHalfHeight = Math.max(size.y / 2, 0.01);
+    modelRadius = Math.max(0.5 * Math.hypot(size.x, size.y, size.z), 0.25);
+  }
+  parent?.add(group);
 }
 
 function disposeMaterial(material) {
@@ -724,6 +730,7 @@ function disposeGroup(group) {
   group.traverse((o) => {
     o.geometry?.dispose();
     materialsOf(o).forEach(disposeMaterial);
+    if (o.isSkinnedMesh) o.skeleton?.dispose(); // frees the bone DataTexture
   });
 }
 
@@ -819,7 +826,9 @@ function onLoadFailed(err, name, token) {
   showError(describeLoadError(err, name));
   // Keep the UI consistent with what is really on stage.
   activeModelName = loadedModelName;
+  setUrlModel(models.some((m) => m.name === loadedModelName) ? loadedModelName : null);
   renderModelList();
+  renderVariantsUI(); // the displayed model's variants (hidden while the failed load ran)
   if (!currentInner) showEmpty('Nothing loaded', 'Pick another model, or drop a USD file here.');
 }
 
@@ -828,8 +837,9 @@ function onLoadFailed(err, name, token) {
 const fileLoader = new FileLoader().setResponseType('arraybuffer');
 
 // Parse off the current task (so the "Loading…" text paints first) and wait
-// for the textures.
-async function parseBuffer(buffer, variantSelections = {}) {
+// for the textures. `bakeCache` holds MaterialX bakes for this one source file;
+// status messages are dropped once `token` is superseded.
+async function parseBuffer(buffer, { selections: variantSelections = {}, bakeCache, token }) {
   await new Promise((r) => setTimeout(r, 20));
   const result = composeUSD(buffer, variantSelections);
   _lastParsedData = result.data;
@@ -838,7 +848,10 @@ async function parseBuffer(buffer, variantSelections = {}) {
   // beyond the composer; bake them to textures so variants render correctly.
   try {
     const effective = Object.fromEntries(result.variants.map((v) => [v.name, variantSelections[v.name] || v.selected]));
-    const { applied, notes } = await applyMaterialXFallbacks(result.group, result.data?.specsByPath, result.assets, effective, result.basePath, (msg) => setLoading(true, msg));
+    const onStatus = (msg) => {
+      if (token === loadToken) setLoading(true, msg);
+    };
+    const { applied, notes } = await applyMaterialXFallbacks(result.group, result.data?.specsByPath, result.assets, effective, result.basePath, onStatus, bakeCache);
     result.materialNotes = notes;
     if (applied) console.info(`MaterialX: baked ${applied} texture map${applied === 1 ? '' : 's'} the composer could not resolve.`);
     for (const note of notes) console.info('MaterialX:', note);
@@ -849,33 +862,25 @@ async function parseBuffer(buffer, variantSelections = {}) {
 }
 
 // The source of the model on stage, kept so variants can be switched without
-// a re-download. Cleared whenever another model starts loading.
-const source = { buffer: null, name: null, meta: null, variants: [], selections: {}, notes: [] };
+// a re-download. Replaced only once another model has parsed successfully, so
+// a failed load leaves the displayed model's variants usable.
+const source = { buffer: null, name: null, meta: null, variants: [], selections: {}, notes: [], bakeCache: new Map() };
 let _lastParsedData = null; // root layer of the last compose (debug/inspection)
-function rememberSource(buffer, name, meta, variants, notes = []) {
-  source.notes = notes;
+function rememberSource(buffer, name, meta, variants, notes, bakeCache) {
+  source.notes = notes || [];
   source.buffer = buffer;
   source.name = name;
   source.meta = meta;
   source.variants = variants;
   source.selections = Object.fromEntries(variants.map((v) => [v.name, v.selected]));
-  renderVariantsUI();
-}
-function forgetSource() {
-  clearMaterialXCache();
-  source.buffer = null;
-  source.name = null;
-  source.meta = null;
-  source.variants = [];
-  source.selections = {};
-  source.notes = [];
+  source.bakeCache = bakeCache;
   renderVariantsUI();
 }
 
 let loadToken = 0;
 async function loadModel(model) {
   const token = ++loadToken;
-  forgetSource();
+  hideVariantsUI(); // switching the old model's variants now would cancel this load
   setLoading(true, `Loading ${model.name}…`);
   clearError();
   hideEmpty();
@@ -885,13 +890,14 @@ async function loadModel(model) {
     });
     if (token !== loadToken) return; // a newer selection superseded this one
     setLoading(true, `Preparing ${model.name}…`);
-    const parsed = await parseBuffer(buffer);
+    const bakeCache = new Map();
+    const parsed = await parseBuffer(buffer, { bakeCache, token });
     if (token !== loadToken) {
       disposeGroup(parsed.group);
       return;
     }
     const meta = { size: model.size, extension: model.extension, thumbKey: model.name, thumbVersion: model.modified };
-    rememberSource(buffer, model.name, meta, parsed.variants, parsed.materialNotes); // before install so Model info sees the sets
+    rememberSource(buffer, model.name, meta, parsed.variants, parsed.materialNotes, bakeCache); // before install so Model info sees the sets
     installGroup(parsed.group, model.name, meta);
   } catch (err) {
     onLoadFailed(err, model.name, token);
@@ -914,11 +920,12 @@ async function applyVariant(setName, option) {
     }
   }
   const token = ++loadToken;
+  const prevSelections = source.selections;
   source.selections = { ...source.selections, [setName]: option };
   setLoading(true, `Switching ${setName} → ${option}…`);
   clearError();
   try {
-    const parsed = await parseBuffer(source.buffer, source.selections);
+    const parsed = await parseBuffer(source.buffer, { selections: source.selections, bakeCache: source.bakeCache, token });
     if (token !== loadToken) {
       disposeGroup(parsed.group);
       return;
@@ -928,6 +935,11 @@ async function applyVariant(setName, option) {
     renderVariantsUI();
     installGroup(parsed.group, source.name, { ...source.meta, thumbKey: undefined, keepCamera: true });
   } catch (err) {
+    if (token === loadToken) {
+      // Keep the controls in step with what is still on stage.
+      source.selections = prevSelections;
+      renderVariantsUI();
+    }
     onLoadFailed(err, source.name, token);
   }
 }
@@ -960,6 +972,9 @@ function renderVariantsUI() {
     });
   });
 }
+function hideVariantsUI() {
+  $('#details-variants').hidden = true;
+}
 
 // Preview a file from the user's machine without uploading it anywhere.
 async function loadLocalFile(file) {
@@ -972,15 +987,17 @@ async function loadLocalFile(file) {
     return;
   }
   const token = ++loadToken;
+  if (genState.running) genState.cancel = true;
   const name = `${file.name} (local file)`;
-  forgetSource();
+  hideVariantsUI();
   setLoading(true, `Reading ${file.name}…`);
   clearError();
   hideEmpty();
   try {
     const buffer = await file.arrayBuffer();
     if (token !== loadToken) return;
-    const parsed = await parseBuffer(buffer);
+    const bakeCache = new Map();
+    const parsed = await parseBuffer(buffer, { bakeCache, token });
     if (token !== loadToken) {
       disposeGroup(parsed.group);
       return;
@@ -991,7 +1008,7 @@ async function loadLocalFile(file) {
     renderModelList();
     setUrlModel(null); // a local file has no shareable server URL
     const meta = { size: file.size, extension: extOf(file.name) };
-    rememberSource(buffer, name, meta, parsed.variants, parsed.materialNotes);
+    rememberSource(buffer, name, meta, parsed.variants, parsed.materialNotes, bakeCache);
     installGroup(parsed.group, name, meta);
   } catch (err) {
     onLoadFailed(err, file.name, token);
@@ -1094,9 +1111,17 @@ function setPlaying(on) {
   invalidate();
 }
 
+// In ping-pong mode three keeps action.time rising on every pass and mirrors
+// the pose (duration - time) on odd passes; map between the two views.
+function onMirroredPass() {
+  return anim.loop === 'pingpong' && (anim.action._loopCount & 1) === 1;
+}
+
 function seekTo(t) {
   if (!anim.action) return;
-  anim.action.time = clamp(t, 0, anim.clips[anim.index].duration);
+  const d = anim.clips[anim.index].duration;
+  const shown = clamp(t, 0, d);
+  anim.action.time = onMirroredPass() ? d - shown : shown;
   anim.mixer.update(0); // apply the pose at the new time even while paused
   updateTransportTime();
   invalidate();
@@ -1115,10 +1140,12 @@ function setLoopMode(mode) {
   updateTransportUI();
 }
 
-// Map a variant option onto a loaded clip index (name match, then positional).
+// Map a variant option onto a loaded clip index (exact name, then partial
+// match, then positional).
 function resolveClipIndex(set, option) {
   if (!set || option == null || !anim.clips.length) return -1;
-  let idx = anim.clips.findIndex((c) => namesMatch(c.name, option));
+  let idx = anim.clips.findIndex((c) => foldText(c.name) === foldText(option));
+  if (idx < 0) idx = anim.clips.findIndex((c) => namesMatch(c.name, option));
   if (idx < 0 && set.options.length === anim.clips.length) idx = set.options.indexOf(option);
   return idx;
 }
@@ -1129,7 +1156,8 @@ function syncAnimVariantSelection() {
   const set = animVariantSet();
   if (!set || !anim.clips.length) return;
   const clip = anim.clips[anim.index];
-  let opt = set.options.find((o) => namesMatch(clip?.name, o)) || null;
+  const name = foldText(clip?.name);
+  let opt = set.options.find((o) => foldText(o) === name) || set.options.find((o) => namesMatch(clip?.name, o)) || null;
   if (!opt && set.options.length === anim.clips.length) opt = set.options[anim.index];
   if (opt && source.selections[set.name] !== opt) {
     source.selections[set.name] = opt;
@@ -1152,7 +1180,7 @@ function tickAnimation(dt) {
 function updateTransportTime() {
   if (!anim.action) return;
   const d = anim.clips[anim.index].duration;
-  const t = clamp(anim.action.time, 0, d);
+  const t = clamp(onMirroredPass() ? d - anim.action.time : anim.action.time, 0, d);
   const scrub = $('#anim-scrub');
   if (document.activeElement !== scrub) scrub.value = t; // don't fight the user's drag
   $('#anim-time').textContent = `${formatTime(t)} / ${formatTime(d)}`;
@@ -1196,10 +1224,14 @@ function wireTransport() {
     if (anim.playing) setPlaying(false); // pause while scrubbing
   });
   scrub.addEventListener('input', () => seekTo(parseFloat(scrub.value)));
-  scrub.addEventListener('change', () => {
+  // A click on the thumb fires no `change` (value unchanged), so resume on release too.
+  const endScrub = () => {
     if (_scrubWasPlaying) setPlaying(true);
     _scrubWasPlaying = false;
-  });
+  };
+  scrub.addEventListener('change', endScrub);
+  scrub.addEventListener('pointerup', endScrub);
+  scrub.addEventListener('pointercancel', endScrub);
   $('#anim-clip').addEventListener('change', (e) => playClip(parseInt(e.target.value, 10)));
   $('#anim-speed').addEventListener('change', (e) => setSpeed(parseFloat(e.target.value)));
   $('#anim-loop').addEventListener('change', (e) => setLoopMode(e.target.value));
@@ -1351,7 +1383,7 @@ async function fetchModels({ autoload = false } = {}) {
       if (linkedModel) {
         wanted = models.find((m) => m.name === linkedModel) || models.find((m) => foldText(m.name) === foldText(linkedModel)) || null;
       }
-      selectModel(wanted || models[0]);
+      selectModel(wanted || models[0], { keepTransform: true }); // restore the persisted transform on start-up
       if (linkedModel && !wanted) {
         showError(`The linked model "${linkedModel}" is not in ./data — opened the first model instead.`);
       }
@@ -1482,7 +1514,7 @@ async function generateAllPreviews() {
   const restore = loadedModelName;
   let done = 0;
   for (const m of todo) {
-    if (genState.cancel) break;
+    if (genState.cancel) break; // also set when the user picks a model mid-run
     text.textContent = `Generating previews ${done + 1} / ${todo.length} — ${m.name}`;
     bar.style.width = `${Math.round((done / todo.length) * 100)}%`;
     await loadModelAndCapture(m);
@@ -1494,8 +1526,9 @@ async function generateAllPreviews() {
   setTimeout(() => (status.hidden = true), 2200);
   genState.running = false;
   $('#gen-previews').disabled = false;
-  // Put the model the user was looking at back on stage (gallery stays open).
-  const back = models.find((m) => m.name === restore);
+  // Put the model the user was looking at back on stage (gallery stays open),
+  // unless they picked another one meanwhile (which cancelled the run).
+  const back = genState.cancel ? null : models.find((m) => m.name === restore);
   if (back && loadedModelName !== back.name) {
     activeModelName = back.name;
     loadModel(back);
@@ -1659,11 +1692,12 @@ function wireGallery() {
   });
 }
 
-function selectModel(model) {
+function selectModel(model, { keepTransform = false } = {}) {
+  if (genState.running) genState.cancel = true; // the user's pick wins over "Generate previews"
   activeModelName = model.name;
   setUrlModel(model.name);
   // Reset model-specific transform; keep global lighting/environment settings.
-  resetModelTransform({ unplaceAR: true });
+  if (!keepTransform) resetModelTransform({ unplaceAR: true });
   refreshAllControls();
   renderModelList();
   closeModels();
@@ -1714,6 +1748,7 @@ const ar = {
   prevA: false,
   prevB: false,
   hudAt: 0,
+  savedCamera: null, // desktop camera + orbit target, restored when AR ends
 };
 const _yawQuat = new Quaternion();
 const _yAxis = new Vector3(0, 1, 0);
@@ -1753,6 +1788,8 @@ function onXRStart() {
   ar.lightProbe = null;
   ar.reticleVisible = false;
   controls.enabled = false;
+  // three overwrites the camera with the headset pose; keep the desktop view.
+  ar.savedCamera = { position: camera.position.clone(), quaternion: camera.quaternion.clone(), target: controls.target.clone() };
 
   // Quest-friendly rendering: fixed-foveation reduces peripheral shading cost;
   // native framebuffer scale keeps the centered model crisp. Guarded because
@@ -1812,6 +1849,14 @@ function onXREnd() {
   applyGround();
   applyTransform(); // restore desktop transform
   applyLighting(); // restore desktop light intensities
+  if (ar.savedCamera) {
+    camera.position.copy(ar.savedCamera.position);
+    camera.quaternion.copy(ar.savedCamera.quaternion);
+    controls.target.copy(ar.savedCamera.target);
+    ar.savedCamera = null;
+    controls.update();
+  }
+  invalidate();
 }
 
 function onARSelect() {
@@ -1855,7 +1900,7 @@ function handleARAction(action) {
       renderer.xr.getSession()?.end();
       return;
   }
-  ar.scaleMul = clamp(ar.scaleMul, 0.05, 40);
+  ar.scaleMul = clamp(ar.scaleMul, AR_SCALE_MIN, AR_SCALE_MAX);
   if (ar.placed) applyARPlacement();
   else updateARStatus('Select a surface first to place the model');
 }
@@ -1884,6 +1929,8 @@ function updateARStatus(text) {
 // Deadzone + rates for controller-driven manipulation.
 const AR_DEADZONE = 0.15;
 const AR_SCALE_PER_SEC = 1.8; // full stick ≈ x6 per second
+const AR_SCALE_MIN = 0.02; // limits for ar.scaleMul, shared by stick and buttons
+const AR_SCALE_MAX = 100;
 const AR_ROT_PER_SEC = 2.2; // radians/sec at full stick
 
 // Transient HUD text, throttled so it doesn't thrash the dom-overlay.
@@ -1934,7 +1981,7 @@ function pollARControllers(dt) {
     }
     let changed = false;
     if (ay) {
-      ar.scaleMul = clamp(ar.scaleMul * Math.exp(-ay * AR_SCALE_PER_SEC * dt), 0.02, 100);
+      ar.scaleMul = clamp(ar.scaleMul * Math.exp(-ay * AR_SCALE_PER_SEC * dt), AR_SCALE_MIN, AR_SCALE_MAX);
       changed = true;
     }
     if (ax) {
