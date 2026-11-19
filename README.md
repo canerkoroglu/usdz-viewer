@@ -56,8 +56,10 @@ returned. See [SECURITY.md](SECURITY.md) for the full security model.
 
 ## Deploying the prebuilt image (e.g. the Windows Docker host)
 
-CI publishes `ghcr.io/canerkoroglu/usdz-viewer:latest` (plus a short-SHA tag) on every push to
-`main`. On the host you can then skip building entirely:
+The image is built on demand, not on every push. Publish `ghcr.io/canerkoroglu/usdz-viewer:latest`
+(plus a short-SHA tag) by running the **CI** workflow manually on `main` (Actions → CI → *Run
+workflow*), or by pushing a version tag (`git tag v1.2.0 && git push --tags`, which also tags the
+image `1.2.0`). On the host you can then skip building entirely:
 
 ```bash
 docker compose pull
@@ -123,10 +125,11 @@ npm run build:watch                  # rebuild dist/ on every change (pair with 
 
 Requires Node.js 24 or newer (the Docker image and CI use Node 26).
 
-CI (`.github/workflows/ci.yml`) runs on Node 24 and 26: `npm audit`, lint, the format check, the
-test-suite and the build, then builds the Docker image (with SBOM and provenance; pushed and
-attested on `main`). Pull requests also get a dependency review, CodeQL scans weekly and on every
-change, and Dependabot keeps npm packages, GitHub Actions (SHA-pinned) and the base image current.
+CI (`.github/workflows/ci.yml`) runs on Node 24 and 26 for pushes to `main` and pull requests
+(docs-only changes are skipped): `npm audit`, lint, the format check, the test-suite and the build.
+The Docker image (with SBOM and provenance, pushed and attested) is built only on a manual run or a
+`v*` tag. Pull requests also get a dependency review, CodeQL scans pull requests and weekly, and
+Dependabot keeps npm packages, GitHub Actions (SHA-pinned) and the base image current.
 
 ## Project layout
 
