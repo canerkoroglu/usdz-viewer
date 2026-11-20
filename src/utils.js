@@ -22,7 +22,8 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 export function deepMerge(target, patch) {
   if (!isPlainObject(patch)) return target;
   for (const k of Object.keys(patch)) {
-    if (UNSAFE_KEYS.has(k)) continue;
+    // Literal comparisons (not UNSAFE_KEYS.has) so static analysis sees the guard.
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     if (isPlainObject(patch[k]) && isPlainObject(target[k])) deepMerge(target[k], patch[k]);
     else target[k] = patch[k];
   }
