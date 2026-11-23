@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — build the Vite frontend bundle
 # ---------------------------------------------------------------------------
-FROM node:26.12.1-alpine3.24 AS build
+FROM node:26.13.1-alpine3.24 AS build
 WORKDIR /app
 
 # Install ALL dependencies (incl. devDeps: vite, three) reproducibly from the
@@ -22,7 +22,7 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Stage 2 — production dependencies only (express, helmet, rate limiter)
 # ---------------------------------------------------------------------------
-FROM node:26.12.1-alpine3.24 AS deps
+FROM node:26.13.1-alpine3.24 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
@@ -30,7 +30,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 # ---------------------------------------------------------------------------
 # Stage 3 — minimal runtime image
 # ---------------------------------------------------------------------------
-FROM node:26.12.1-alpine3.24 AS runtime
+FROM node:26.13.1-alpine3.24 AS runtime
 
 LABEL org.opencontainers.image.title="usdz-viewer" \
       org.opencontainers.image.description="Lightweight web viewer for USD/USDA/USDC/USDZ with WebXR AR" \
